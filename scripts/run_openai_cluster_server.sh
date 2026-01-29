@@ -5,8 +5,8 @@ set -euo pipefail
 # Settings
 # ---------
 ENV_NAME="${ENV_NAME:-mlxjccl}"
-HOSTFILE="${HOSTFILE:-/Users/alex/Code/mlx_ibv/m3-ultra-jaccl.json}"
-SERVER_PY="${SERVER_PY:-/Users/alex/Code/mlx_ibv/openai_cluster_server.py}"
+HOSTFILE="${HOSTFILE:-/Users/alex/Code/mlx-jaccl-cluster/hostfiles/m3-ultra-jaccl.local.json}"
+SERVER_PY="${SERVER_PY:-/Users/alex/Code/mlx-jaccl-cluster/server/openai_cluster_server.py}"
 
 MODEL_DIR="${MODEL_DIR:-/Users/alex/models_mlx/mlx-community/Qwen3-4B-Instruct-2507-4bit}"
 MODEL_ID="${MODEL_ID:-Qwen3-4B-Instruct-2507-4bit}"

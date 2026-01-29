@@ -10,7 +10,9 @@ import uuid
 from typing import Optional, Union, AsyncGenerator
 
 import mlx.core as mx
-from mlx_lm.utils import sharded_load
+import sys
+from pathlib import Path
+from mlx_lm.utils import sharded_load, load_model
 
 # generate() import differs across mlx-lm branches
 try:
@@ -31,6 +33,70 @@ from fastapi import FastAPI, HTTPException
 from starlette.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
+
+
+# -------------------------
+# Custom tokenizer support
+# -------------------------
+class TokenizerWrapper:
+    """Wrapper to handle encode kwargs that some custom tokenizers don't support."""
+    def __init__(self, tokenizer):
+        self._tok = tokenizer
+
+    def __getattr__(self, name):
+        return getattr(self._tok, name)
+
+    def encode(self, text, **kwargs):
+        return self._tok.encode(text)
+
+    def decode(self, tokens, **kwargs):
+        return self._tok.decode(tokens)
+
+
+def load_custom_tokenizer(model_path):
+    """Load custom tokenizer directly when AutoTokenizer fails."""
+    model_path = Path(model_path)
+    sys.path.insert(0, str(model_path))
+
+    for tok_file in model_path.glob("tokenization_*.py"):
+        module_name = tok_file.stem
+        mod = __import__(module_name)
+        for attr in dir(mod):
+            cls = getattr(mod, attr)
+            if isinstance(cls, type) and hasattr(cls, 'from_pretrained'):
+                try:
+                    tok = cls.from_pretrained(model_path)
+                    return TokenizerWrapper(tok)
+                except:
+                    continue
+    raise RuntimeError(f"Could not load custom tokenizer from {model_path}")
+
+
+def sharded_load_with_fallback(repo):
+    """Load model with fallback for custom tokenizers."""
+    model_path = Path(repo)
+
+    try:
+        return sharded_load(repo)
+    except Exception as e:
+        if "tokenizer" not in str(e).lower() and "NoneType" not in str(e):
+            raise
+
+    # Fallback: load model and tokenizer separately
+    tok = load_custom_tokenizer(model_path)
+    model, config = load_model(model_path, lazy=True, strict=False)
+
+    tensor_group = mx.distributed.init()
+    if hasattr(model, "shard"):
+        model.shard(tensor_group)
+
+    mx.eval(model.parameters())
+
+    x = mx.zeros((1,))
+    mx.eval(mx.distributed.all_sum(x))
+
+    return model, tok
+
 
 # -------------------------
 # Configuration (env vars)
@@ -523,7 +589,7 @@ async def completions(req: CompletionsReq):
 def main() -> None:
     global _model, _tok, _world
     _world = mx.distributed.init()
-    _model, _tok = sharded_load(MODEL_DIR)
+    _model, _tok = sharded_load_with_fallback(MODEL_DIR)
 
     if _world.rank() == 0:
         th = threading.Thread(target=rank0_accept_workers, args=(_world.size(),), daemon=True)
