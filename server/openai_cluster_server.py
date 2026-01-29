@@ -7,7 +7,7 @@ import struct
 import threading
 import asyncio
 import uuid
-from typing import Optional, Union
+from typing import Optional, Union, AsyncGenerator
 
 import mlx.core as mx
 from mlx_lm.utils import sharded_load
@@ -18,7 +18,17 @@ try:
 except Exception:
     from mlx_lm.generate import generate
 
+# stream_generate for SSE streaming
+try:
+    from mlx_lm.utils import stream_generate
+except ImportError:
+    try:
+        from mlx_lm.generate import stream_generate
+    except ImportError:
+        stream_generate = None
+
 from fastapi import FastAPI, HTTPException
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -221,9 +231,9 @@ async def _queue_worker() -> None:
     Processes queued requests sequentially.
     Each request triggers:
       - broadcast task to workers
-      - rank0 generate()
+      - rank0 generate() or stream_generate()
       - wait for worker completion
-      - fulfill per-request future with an OpenAI-shaped response
+      - fulfill per-request future with an OpenAI-shaped response (or stream chunks)
     """
     while True:
         item = await _queue.get()
@@ -231,62 +241,145 @@ async def _queue_worker() -> None:
             _queue.task_done()
             continue
 
-        kind, prompt, max_t, fut = item  # kind: "chat" | "completions"
+        kind, prompt, max_t, result_target, is_stream = item  # kind: "chat" | "completions"
         try:
             rank0_broadcast_task({"prompt": prompt, "max_tokens": max_t})
 
-            t0 = time.time()
-            out_text = generate(_model, _tok, prompt, max_tokens=max_t)
-            mx.eval()
-            t1 = time.time()
+            if is_stream and stream_generate is not None:
+                # Streaming mode: yield chunks via async queue
+                chunk_queue: asyncio.Queue = result_target
+                req_id = f"chatcmpl-{uuid.uuid4().hex[:24]}" if kind == "chat" else f"cmpl-{uuid.uuid4().hex[:24]}"
+                created = int(time.time())
 
-            rank0_wait_done(_world.size())
+                t0 = time.time()
+                token_count = 0
 
-            completion = out_text[len(prompt):] if out_text.startswith(prompt) else out_text
-            pt = _tok_len(prompt)
-            ct = _tok_len(completion)
+                for response in stream_generate(_model, _tok, prompt, max_tokens=max_t):
+                    token_count += 1
+                    token_text = response.text  # GenerationResponse.text contains the decoded text
+                    if kind == "chat":
+                        chunk = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_ID,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": token_text},
+                                "finish_reason": None,
+                            }],
+                        }
+                    else:  # completions
+                        chunk = {
+                            "id": req_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": MODEL_ID,
+                            "choices": [{
+                                "index": 0,
+                                "text": token_text,
+                                "finish_reason": None,
+                                "logprobs": None,
+                            }],
+                        }
+                    await chunk_queue.put(f"data: {json.dumps(chunk)}\n\n")
 
-            timing = {
-                "seconds": round(t1 - t0, 3),
-                "tokens_per_sec": round(ct / max(t1 - t0, 1e-9), 3),
-            }
+                mx.eval()
+                t1 = time.time()
 
-            if kind == "chat":
-                resp = {
-                    "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": MODEL_ID,
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": completion},
-                        "finish_reason": "stop",
-                    }],
-                    "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
-                    "timing": timing,
-                }
-            elif kind == "completions":
-                resp = {
-                    "id": f"cmpl-{uuid.uuid4().hex[:24]}",
-                    "object": "text_completion",
-                    "created": int(time.time()),
-                    "model": MODEL_ID,
-                    "choices": [{
-                        "index": 0,
-                        "text": completion,
-                        "finish_reason": "stop",
-                        "logprobs": None,
-                    }],
-                    "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
-                    "timing": timing,
-                }
+                # Send final chunk with finish_reason
+                if kind == "chat":
+                    final_chunk = {
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_ID,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }],
+                    }
+                else:
+                    final_chunk = {
+                        "id": req_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": MODEL_ID,
+                        "choices": [{
+                            "index": 0,
+                            "text": "",
+                            "finish_reason": "stop",
+                            "logprobs": None,
+                        }],
+                    }
+                await chunk_queue.put(f"data: {json.dumps(final_chunk)}\n\n")
+                await chunk_queue.put("data: [DONE]\n\n")
+                await chunk_queue.put(None)  # Signal end of stream
+
+                rank0_wait_done(_world.size())
+
             else:
-                raise RuntimeError(f"Unknown request kind: {kind}")
+                # Non-streaming mode: use future
+                fut: asyncio.Future = result_target
+                t0 = time.time()
+                out_text = generate(_model, _tok, prompt, max_tokens=max_t)
+                mx.eval()
+                t1 = time.time()
 
-            fut.set_result(resp)
+                rank0_wait_done(_world.size())
+
+                completion = out_text[len(prompt):] if out_text.startswith(prompt) else out_text
+                pt = _tok_len(prompt)
+                ct = _tok_len(completion)
+
+                timing = {
+                    "seconds": round(t1 - t0, 3),
+                    "tokens_per_sec": round(ct / max(t1 - t0, 1e-9), 3),
+                }
+
+                if kind == "chat":
+                    resp = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": MODEL_ID,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": completion},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+                        "timing": timing,
+                    }
+                elif kind == "completions":
+                    resp = {
+                        "id": f"cmpl-{uuid.uuid4().hex[:24]}",
+                        "object": "text_completion",
+                        "created": int(time.time()),
+                        "model": MODEL_ID,
+                        "choices": [{
+                            "index": 0,
+                            "text": completion,
+                            "finish_reason": "stop",
+                            "logprobs": None,
+                        }],
+                        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+                        "timing": timing,
+                    }
+                else:
+                    raise RuntimeError(f"Unknown request kind: {kind}")
+
+                fut.set_result(resp)
 
         except Exception as e:
-            fut.set_exception(e)
+            if is_stream:
+                chunk_queue: asyncio.Queue = result_target
+                await chunk_queue.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+                await chunk_queue.put("data: [DONE]\n\n")
+                await chunk_queue.put(None)
+            else:
+                result_target.set_exception(e)
         finally:
             _queue.task_done()
 
@@ -318,10 +411,19 @@ def list_models() -> dict:
 def queue_status() -> dict:
     return {"size": _queue.qsize(), "max": QUEUE_MAX}
 
+async def _stream_generator(chunk_queue: asyncio.Queue) -> AsyncGenerator[str, None]:
+    """Yield SSE chunks from the queue until None is received."""
+    while True:
+        chunk = await chunk_queue.get()
+        if chunk is None:
+            break
+        yield chunk
+
+
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionsReq) -> dict:
-    if req.stream:
-        raise HTTPException(status_code=400, detail="stream=true not supported")
+async def chat_completions(req: ChatCompletionsReq):
+    if req.stream and stream_generate is None:
+        raise HTTPException(status_code=400, detail="stream=true not supported (stream_generate not available)")
     if req.model and req.model != MODEL_ID:
         raise HTTPException(status_code=400, detail=f"Only model '{MODEL_ID}' is served")
 
@@ -331,23 +433,42 @@ async def chat_completions(req: ChatCompletionsReq) -> dict:
     prompt = _build_chat_prompt(req.messages)
     max_t = req.max_tokens or DEFAULT_MAX_TOKENS
 
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future = loop.create_future()
+    if req.stream:
+        # Streaming mode: return SSE response
+        chunk_queue: asyncio.Queue = asyncio.Queue()
+        try:
+            _queue.put_nowait(("chat", prompt, max_t, chunk_queue, True))
+        except asyncio.QueueFull:
+            raise HTTPException(status_code=429, detail="Server busy (queue full). Try again later.")
 
-    try:
-        _queue.put_nowait(("chat", prompt, max_t, fut))
-    except asyncio.QueueFull:
-        raise HTTPException(status_code=429, detail="Server busy (queue full). Try again later.")
+        return StreamingResponse(
+            _stream_generator(chunk_queue),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    else:
+        # Non-streaming mode: return JSON response
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
 
-    try:
-        return await asyncio.wait_for(fut, timeout=REQ_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Request timed out")
+        try:
+            _queue.put_nowait(("chat", prompt, max_t, fut, False))
+        except asyncio.QueueFull:
+            raise HTTPException(status_code=429, detail="Server busy (queue full). Try again later.")
+
+        try:
+            return await asyncio.wait_for(fut, timeout=REQ_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Request timed out")
 
 @app.post("/v1/completions")
-async def completions(req: CompletionsReq) -> dict:
-    if req.stream:
-        raise HTTPException(status_code=400, detail="stream=true not supported")
+async def completions(req: CompletionsReq):
+    if req.stream and stream_generate is None:
+        raise HTTPException(status_code=400, detail="stream=true not supported (stream_generate not available)")
     if req.model and req.model != MODEL_ID:
         raise HTTPException(status_code=400, detail=f"Only model '{MODEL_ID}' is served")
 
@@ -364,18 +485,37 @@ async def completions(req: CompletionsReq) -> dict:
 
     max_t = req.max_tokens or DEFAULT_MAX_TOKENS
 
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future = loop.create_future()
+    if req.stream:
+        # Streaming mode: return SSE response
+        chunk_queue: asyncio.Queue = asyncio.Queue()
+        try:
+            _queue.put_nowait(("completions", prompt, max_t, chunk_queue, True))
+        except asyncio.QueueFull:
+            raise HTTPException(status_code=429, detail="Server busy (queue full). Try again later.")
 
-    try:
-        _queue.put_nowait(("completions", prompt, max_t, fut))
-    except asyncio.QueueFull:
-        raise HTTPException(status_code=429, detail="Server busy (queue full). Try again later.")
+        return StreamingResponse(
+            _stream_generator(chunk_queue),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    else:
+        # Non-streaming mode: return JSON response
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
 
-    try:
-        return await asyncio.wait_for(fut, timeout=REQ_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Request timed out")
+        try:
+            _queue.put_nowait(("completions", prompt, max_t, fut, False))
+        except asyncio.QueueFull:
+            raise HTTPException(status_code=429, detail="Server busy (queue full). Try again later.")
+
+        try:
+            return await asyncio.wait_for(fut, timeout=REQ_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Request timed out")
 
 # -------------------------
 # Main
