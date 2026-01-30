@@ -140,8 +140,33 @@ These environment variables are passed to all nodes via `mlx.launch --env`:
 | Variable | Description |
 |----------|-------------|
 | `MLX_METAL_FAST_SYNCH=1` | **Critical for performance.** Enables fast Metal synchronization. Without this, you may see 5-6x slower inference speeds. |
-| `HF_HUB_OFFLINE=1` | Prevents HuggingFace Hub from attempting to download models. Recommended when using local models. |
-| `TRANSFORMERS_OFFLINE=1` | Prevents transformers library from making network requests. Recommended when using local models. |
+| `HF_HUB_OFFLINE=1` | **Prevents automatic model downloads.** See below. |
+| `TRANSFORMERS_OFFLINE=1` | **Prevents automatic model downloads.** See below. |
+
+#### Why use offline mode?
+
+The `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` flags prevent HuggingFace from automatically downloading models. This is important for distributed clusters because:
+
+1. **All nodes would download simultaneously** — wasteful and slow
+2. **Nodes may have different network access** — some might fail while others succeed
+3. **Race conditions** — nodes may end up with inconsistent model states
+4. **Unpredictable startup times** — downloading large models can take a long time
+
+**Best practice:** Download models once on rank0, then sync to all nodes:
+
+```bash
+# 1. Download on rank0
+python -c "from mlx_lm import load; load('mlx-community/Qwen3-4B-Instruct-2507-4bit')"
+
+# 2. Sync to other nodes (reads hosts from your hostfile)
+MODEL_PATH=~/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit
+OTHER_HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))[1:]))")
+for h in $OTHER_HOSTS; do
+  rsync -a --progress "$MODEL_PATH/" "$h:$MODEL_PATH/"
+done
+```
+
+Or use a shared model directory that exists on all nodes at the same path.
 
 ---
 

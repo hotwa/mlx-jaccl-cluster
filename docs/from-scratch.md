@@ -189,8 +189,21 @@ These environment variables are passed to all nodes via `mlx.launch --env`:
 | Variable | Description |
 |----------|-------------|
 | `MLX_METAL_FAST_SYNCH=1` | **Critical for performance.** Enables fast Metal synchronization. Without this, you may see 5-6x slower inference speeds. |
-| `HF_HUB_OFFLINE=1` | Prevents HuggingFace Hub from attempting to download models. Recommended when using local models. |
-| `TRANSFORMERS_OFFLINE=1` | Prevents transformers library from making network requests. Recommended when using local models. |
+| `HF_HUB_OFFLINE=1` | **Prevents automatic model downloads.** See below. |
+| `TRANSFORMERS_OFFLINE=1` | **Prevents automatic model downloads.** See below. |
+
+### Why use offline mode?
+
+The `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` flags prevent HuggingFace from automatically downloading models. This is critical for distributed clusters because:
+
+1. **All nodes would download simultaneously** — wasteful and slow
+2. **Nodes may have different network access** — some might fail while others succeed
+3. **Race conditions** — nodes may end up with inconsistent model states
+4. **Unpredictable startup times** — downloading large models can take a long time
+
+Without these flags, if you specify a model that doesn't exist locally (e.g., `mlx-community/Qwen3-4B`), each node will attempt to download it from HuggingFace Hub independently.
+
+**Best practice:** Always download models once on rank0, then sync to all other nodes (see step 6 above), and run with offline mode enabled.
 
 ---
 
