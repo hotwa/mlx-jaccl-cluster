@@ -65,13 +65,14 @@ Edit `hostfiles/hosts.json`:
 ### 4) Run a distributed tokens/sec benchmark
 
 ```bash
-conda run -n mlxjccl mlx.launch --backend jaccl \
+# Replace <MODEL_PATH> with your actual model path, e.g. ~/models_mlx/Qwen3-4B
+mlx.launch --backend jaccl \
   --hostfile hostfiles/hosts.json \
   --env MLX_METAL_FAST_SYNCH=1 \
   --env HF_HUB_OFFLINE=1 \
   --env TRANSFORMERS_OFFLINE=1 -- \
   python scripts/jaccl_tps_bench.py \
-  --model /path/to/your/mlx-model \
+  --model <MODEL_PATH> \
   --prompt "Write 5 sentences about Thunderbolt RDMA." \
   --max-tokens 256
 ```
@@ -83,7 +84,8 @@ Rank 0 prints:
 ### 5) Start the OpenAI-compatible server (rank 0 HTTP)
 
 ```bash
-MODEL_DIR=/path/to/your/mlx-model ./scripts/run_openai_cluster_server.sh
+# Replace <MODEL_PATH> with your actual model path
+MODEL_DIR=<MODEL_PATH> ./scripts/run_openai_cluster_server.sh
 ```
 
 Test:

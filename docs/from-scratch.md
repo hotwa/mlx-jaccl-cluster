@@ -96,10 +96,11 @@ Edit `hostfiles/hosts.json`:
 
 If you want to run a model from a local folder, the same path must exist on every node.
 
-Example (adjust hosts for your setup):
+Example (adjust for your setup):
 
 ```bash
-MODEL_DIR=/path/to/your/mlx-model
+# Replace with your actual model path
+MODEL_DIR=~/models_mlx/your-model-name
 
 # Check all nodes have the model
 HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))))")
@@ -146,13 +147,14 @@ Rank0 prints tokens/sec.
 Start:
 
 ```bash
-MODEL_DIR=/path/to/your/mlx-model ./scripts/run_openai_cluster_server.sh
+# Replace with your actual model path
+MODEL_DIR=~/models_mlx/your-model-name ./scripts/run_openai_cluster_server.sh
 ```
 
 Or with custom settings:
 
 ```bash
-MODEL_DIR=/path/to/model \
+MODEL_DIR=~/models_mlx/your-model-name \
 HTTP_PORT=8000 \
 HOSTFILE=hostfiles/my-cluster.json \
 ./scripts/run_openai_cluster_server.sh
