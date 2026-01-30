@@ -1,21 +1,21 @@
 [
   {
-    "ssh": "macstudio1.local",
-    "ips": ["<RANK0_COORDINATOR_IP_ON_LAN>"],
+    "ssh": "node1.local",
+    "ips": ["192.168.1.100"],
     "rdma": [null, "rdma_en5", "rdma_en4", "rdma_en3"]
   },
   {
-    "ssh": "macstudio2.local",
+    "ssh": "node2.local",
     "ips": [],
     "rdma": ["rdma_en5", null, "rdma_en3", "rdma_en4"]
   },
   {
-    "ssh": "macstudio3.local",
+    "ssh": "node3.local",
     "ips": [],
     "rdma": ["rdma_en4", "rdma_en3", null, "rdma_en5"]
   },
   {
-    "ssh": "macstudio4.local",
+    "ssh": "node4.local",
     "ips": [],
     "rdma": ["rdma_en3", "rdma_en4", "rdma_en5", null]
   }

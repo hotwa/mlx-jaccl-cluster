@@ -15,4 +15,5 @@ venv/
 
 # Local hostfiles / secrets
 hostfiles/*.local.json
+hostfiles/hosts.json
 *.token

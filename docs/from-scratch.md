@@ -71,23 +71,23 @@ ipconfig getifaddr en0
 Copy the template:
 
 ```bash
-cp hostfiles/m3-ultra-jaccl.template.json hostfiles/m3-ultra-jaccl.local.json
+cp hostfiles/hosts.json.example hostfiles/hosts.json
 ```
 
-Edit `hostfiles/m3-ultra-jaccl.local.json`:
+Edit `hostfiles/hosts.json`:
 
-- set `ssh` hostnames (e.g. `macstudio1.local` …)
+- set `ssh` hostnames (e.g. `node1.local`, `node2.local`, …)
 - set rank0 `"ips": ["<rank0_lan_ip>"]`
 - keep the `rdma` matrix consistent with your wiring
 
-> `hostfiles/*.local.json` is ignored by git.
+> `hostfiles/hosts.json` is ignored by git.
 
 ---
 
 ## 5) Verify the cluster
 
 ```bash
-scripts/verify_cluster.sh
+./scripts/verify_cluster.sh
 ```
 
 ---
@@ -96,21 +96,27 @@ scripts/verify_cluster.sh
 
 If you want to run a model from a local folder, the same path must exist on every node.
 
-Example:
+Example (adjust hosts for your setup):
 
 ```bash
-MODEL_DIR=/Users/alex/models_mlx/mlx-community/Qwen3-4B-Instruct-2507-4bit
+MODEL_DIR=/path/to/your/mlx-model
 
-for h in macstudio1.local macstudio2.local macstudio3.local macstudio4.local; do
-  ssh "$h" "test -f '$MODEL_DIR/model.safetensors' && echo OK || echo MISSING"
+# Check all nodes have the model
+HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))))")
+for h in $HOSTS; do
+  echo -n "$h: "
+  ssh "$h" "test -d '$MODEL_DIR' && echo OK || echo MISSING"
 done
 ```
 
-Copy (rank0 → others) if needed:
+Copy from rank0 to other nodes if needed:
 
 ```bash
-for h in macstudio2.local macstudio3.local macstudio4.local; do
-  ssh "$h" "mkdir -p "$(dirname "$MODEL_DIR")""
+# Get all hosts except the first one (rank0)
+OTHER_HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))[1:]))")
+
+for h in $OTHER_HOSTS; do
+  ssh "$h" "mkdir -p '$(dirname "$MODEL_DIR")'"
   rsync -a --progress -e ssh "$MODEL_DIR/" "$h:$MODEL_DIR/"
 done
 ```
@@ -120,12 +126,12 @@ done
 ## 7) Run the distributed tokens/sec benchmark
 
 ```bash
-/Users/alex/miniconda3/bin/conda run -n mlxjccl mlx.launch --verbose --backend jaccl \
-  --hostfile hostfiles/m3-ultra-jaccl.local.json \
+conda run -n mlxjccl mlx.launch --verbose --backend jaccl \
+  --hostfile hostfiles/hosts.json \
   --env MLX_METAL_FAST_SYNCH=1 \
   --env HF_HUB_OFFLINE=1 \
   --env TRANSFORMERS_OFFLINE=1 -- \
-  scripts/jaccl_tps_bench.py \
+  python scripts/jaccl_tps_bench.py \
   --model "$MODEL_DIR" \
   --prompt "Write 5 sentences about Thunderbolt RDMA." \
   --max-tokens 256
@@ -140,13 +146,22 @@ Rank0 prints tokens/sec.
 Start:
 
 ```bash
-scripts/run_openai_cluster_server.sh
+MODEL_DIR=/path/to/your/mlx-model ./scripts/run_openai_cluster_server.sh
+```
+
+Or with custom settings:
+
+```bash
+MODEL_DIR=/path/to/model \
+HTTP_PORT=8000 \
+HOSTFILE=hostfiles/my-cluster.json \
+./scripts/run_openai_cluster_server.sh
 ```
 
 Stop:
 
 ```bash
-scripts/stop_openai_cluster_server.sh
+./scripts/stop_openai_cluster_server.sh
 ```
 
 Test:
@@ -182,8 +197,11 @@ Pass offline env vars via `mlx.launch --env`:
 ### Stop stuck runs (no reboot)
 
 ```bash
-scripts/stop_openai_cluster_server.sh
-for h in macstudio1.local macstudio2.local macstudio3.local macstudio4.local; do
+./scripts/stop_openai_cluster_server.sh
+
+# If needed, also kill any other MLX processes:
+HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))))")
+for h in $HOSTS; do
   ssh "$h" 'pkill -f "python.*-m mlx_lm" || true'
 done
 ```
