@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 import asyncio
+import atexit
 import json
 import os
+import signal
 import socket
 import struct
 import sys
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Union
 
@@ -139,13 +142,28 @@ REQ_TIMEOUT = float(
     os.environ.get("REQ_TIMEOUT", "120")
 )  # per request timeout (seconds)
 
+
 # -------------------------
 # Globals
 # -------------------------
+# -------------------------
+# Lifespan (replaces deprecated @app.on_event)
+# -------------------------
+@asynccontextmanager
+async def _lifespan(application):
+    """Startup/shutdown lifespan for FastAPI — runs the queue worker on rank0."""
+    if _world and _world.rank() == 0:
+        asyncio.create_task(_queue_worker())
+        _print_ready_banner()
+    yield
+    # shutdown: nothing to clean up (daemon threads die with the process)
+
+
 app = FastAPI(
     title="mlx-jaccl-cluster",
     description="OpenAI-compatible API for a multi-Mac MLX cluster over RDMA/Thunderbolt (JACCL)",
     version="0.1.0",
+    lifespan=_lifespan,
 )
 _model = None
 _tok = None
@@ -304,6 +322,7 @@ def worker_loop(rank: int) -> None:
     """
     Workers connect to rank0 control-plane, block waiting for tasks.
     For each task: call generate() (so collectives match rank0), then send done.
+    Exits cleanly when the control socket closes (rank0 shutdown / Ctrl+C).
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((CTRL_HOST, CTRL_PORT))
@@ -313,10 +332,36 @@ def worker_loop(rank: int) -> None:
         flush=True,
     )
 
+    _none_count = 0  # track consecutive None reads (socket dead)
+
     while True:
-        msg = recv_msg(s)
+        try:
+            msg = recv_msg(s)
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            print(
+                f"\n[worker {rank}] control socket lost — shutting down.",
+                flush=True,
+            )
+            break
+
         if not msg:
+            _none_count += 1
+            if _none_count >= 3:
+                # Socket is dead (rank0 exited) — exit cleanly
+                print(
+                    f"\n[worker {rank}] coordinator disconnected — shutting down.",
+                    flush=True,
+                )
+                break
+            time.sleep(0.1)
             continue
+
+        _none_count = 0  # reset on valid message
+
+        if msg.get("type") == "shutdown":
+            print(f"[worker {rank}] received shutdown — exiting.", flush=True)
+            break
+
         if msg.get("type") != "task":
             continue
 
@@ -326,6 +371,13 @@ def worker_loop(rank: int) -> None:
         _ = generate(_model, _tok, prompt, max_tokens=max_tokens)
         mx.eval()
         send_msg(s, {"type": "done", "rank": rank})
+
+    # Clean exit
+    try:
+        s.close()
+    except Exception:
+        pass
+    print(f"[worker {rank}] stopped. GPU memory released.", flush=True)
 
 
 # -------------------------
@@ -558,13 +610,195 @@ async def _queue_worker() -> None:
             _queue.task_done()
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    # Only rank0 runs the HTTP server, so only rank0 starts the queue worker
-    # Note: dashboard is already mounted in main() before uvicorn.run() —
-    # do NOT call _mount_dashboard_now() here to avoid duplicate route registration.
-    if _world and _world.rank() == 0:
-        asyncio.create_task(_queue_worker())
+def _print_ready_banner() -> None:
+    """Print a production-grade startup banner once the server is fully ready."""
+    W = 71  # inner width between ║ chars (matches 71 ═ in top/bottom borders)
+
+    def _row(text: str = "") -> str:
+        """Return a box row: '  ║' + text padded to W + '║'"""
+        # Emoji like ⚡🧠🌐 occupy 2 display columns but len() counts 1.
+        # Count them and subtract from padding budget.
+        extra = sum(1 for ch in text if ord(ch) > 0xFFFF)
+        return f"  ║{text}{' ' * max(0, W - len(text) - extra)}║"
+
+    def _sep(color: str = "") -> str:
+        rst = "\033[0m" if color else ""
+        return f"{color}  ╔{'═' * W}╗{rst}"
+
+    def _bot(color: str = "") -> str:
+        rst = "\033[0m" if color else ""
+        return f"{color}  ╚{'═' * W}╝{rst}"
+
+    host_display = "localhost" if HOST == "0.0.0.0" else HOST
+    base_url = f"http://{host_display}:{PORT}"
+    world_size = _world.size() if _world else 1
+
+    # ── Gather model metadata ────────────────────────────────────────────
+    model_arch = ""
+    model_quant = ""
+    model_size = ""
+    try:
+        config_path = Path(MODEL_DIR) / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = json.load(f)
+            model_arch = cfg.get(
+                "model_type",
+                cfg.get("architectures", [""])[0] if cfg.get("architectures") else "",
+            )
+            hidden = cfg.get("hidden_size", "")
+            layers = cfg.get("num_hidden_layers", "")
+            if hidden and layers:
+                model_size = f"{hidden}h / {layers}L"
+            q = cfg.get("quantization", {})
+            if q:
+                bits = q.get("bits", "")
+                group = q.get("group_size", "")
+                model_quant = f"{bits}-bit" + (f" (g{group})" if group else "")
+    except Exception:
+        pass
+
+    # ── Gather disk size ─────────────────────────────────────────────────
+    disk_size = ""
+    try:
+        total = sum(f.stat().st_size for f in Path(MODEL_DIR).rglob("*") if f.is_file())
+        disk_size = f"{total / (1024**3):.1f} GB"
+    except Exception:
+        pass
+
+    # ── Gather node info from hostfile ───────────────────────────────────
+    hosts_data = []
+    hostfile = os.environ.get("HOSTFILE", "")
+    if hostfile and os.path.isfile(hostfile):
+        try:
+            with open(hostfile) as f:
+                hosts_data = json.load(f)
+        except Exception:
+            pass
+
+    node_rows = []
+    if hosts_data:
+        for i, h in enumerate(hosts_data):
+            role = "coordinator" if i == 0 else "worker"
+            ssh = h.get("ssh", "?")
+            rdma_devs = h.get("rdma", [])
+            rdma = next((d for d in rdma_devs if d), "—")
+            marker = "★" if i == 0 else "●"
+            node_rows.append(
+                _row(f"  {marker} rank {i}  {ssh:<20s}  {role:<13s} rdma: {rdma}")
+            )
+    else:
+        node_rows.append(_row(f"  ● {world_size} node(s)"))
+
+    # RDMA link line
+    if len(hosts_data) >= 2:
+        n0 = hosts_data[0].get("ssh", "node0")
+        n1 = hosts_data[1].get("ssh", "node1")
+        node_rows.append(_row())
+        node_rows.append(_row(f"    {n0}  <==== RDMA (Thunderbolt) ====>  {n1}"))
+
+    # ── Model detail line ────────────────────────────────────────────────
+    detail_parts = []
+    if model_arch:
+        detail_parts.append(model_arch)
+    if model_quant:
+        detail_parts.append(model_quant)
+    if model_size:
+        detail_parts.append(model_size)
+    if disk_size:
+        detail_parts.append(disk_size)
+    model_detail = "  |  ".join(detail_parts)
+
+    shard_info = ""
+    if disk_size and world_size > 1:
+        try:
+            gb = float(disk_size.replace(" GB", ""))
+            shard_info = f"  ~{gb / world_size:.1f} GB/node (sharded)"
+        except Exception:
+            pass
+
+    tp_line = f"Parallelism: Tensor Parallel x {world_size} nodes{shard_info}"
+
+    # ── Endpoint rows ────────────────────────────────────────────────────
+    endpoints = [
+        ("Chat API", f"{base_url}/v1/chat/completions"),
+        ("Completions", f"{base_url}/v1/completions"),
+        ("Models", f"{base_url}/v1/models"),
+        ("Dashboard", f"{base_url}/dashboard"),
+        ("Health", f"{base_url}/health"),
+    ]
+    ep_rows = []
+    for label, url in endpoints:
+        ep_rows.append(_row(f"  {label:<14s} {url}"))
+
+    # ── Assemble banner ──────────────────────────────────────────────────
+    C = "\033[1;36m"  # cyan bold   — logo
+    Y = "\033[1;33m"  # yellow bold — cluster
+    B = "\033[1m"  # bold        — model
+    G = "\033[1;32m"  # green bold  — API
+    D = "\033[2m"  # dim         — hints
+    R = "\033[0m"  # reset
+
+    lines = [
+        "",
+        f"{C}{_sep()}",
+        f"{C}{_row()}",
+        f"{C}{_row('       ██╗ █████╗  ██████╗ ██████╗██╗')}",
+        f"{C}{_row('       ██║██╔══██╗██╔════╝██╔════╝██║')}",
+        f"{C}{_row('       ██║███████║██║     ██║     ██║')}",
+        f"{C}{_row('  ██   ██║██╔══██║██║     ██║     ██║')}",
+        f"{C}{_row('  ╚█████╔╝██║  ██║╚██████╗╚██████╗███████╗')}",
+        f"{C}{_row('   ╚════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═════╝╚══════╝')}",
+        f"{C}{_row()}",
+        f"{C}{_row('  Distributed ML Inference over RDMA / Thunderbolt')}",
+        f"{C}{_row()}",
+        f"{C}{_bot()}{R}",
+        "",
+        f"{Y}{_sep()}",
+        f"{Y}{_row()}",
+        f"{Y}{_row('  ⚡ Cluster Online')}",
+        f"{Y}{_row()}",
+    ]
+    for nr in node_rows:
+        lines.append(f"{Y}{nr}")
+    lines += [
+        f"{Y}{_row()}",
+        f"{Y}{_bot()}{R}",
+        "",
+        f"{B}{_sep()}",
+        f"{B}{_row()}",
+        f"{B}{_row(f'  🧠 Model: {MODEL_ID}')}",
+        f"{B}{_row(f'     {model_detail}')}",
+        f"{B}{_row(f'     {tp_line}')}",
+        f"{B}{_row()}",
+        f"{B}{_bot()}{R}",
+        "",
+        f"{G}{_sep()}",
+        f"{G}{_row()}",
+        f"{G}{_row('  🌐 API & Dashboard Ready')}",
+        f"{G}{_row()}",
+        f"{G}{_row(f'  {base_url}')}",
+        f"{G}{_row()}",
+    ]
+    for er in ep_rows:
+        lines.append(f"{G}{er}")
+    lines += [
+        f"{G}{_row()}",
+        f"{G}{_bot()}{R}",
+        "",
+        f"  {D}Queue: {QUEUE_MAX} max concurrent  |  Timeout: {REQ_TIMEOUT}s per request{R}",
+        "",
+        f"  {D}Usage:  curl {base_url}/v1/chat/completions \\{R}",
+        f"  {D}        -H 'Content-Type: application/json' \\{R}",
+        f'  {D}        -d \'{{"messages":[{{"role":"user","content":"Hello!"}}],"max_tokens":64}}\'{R}',
+        "",
+        f'  {D}Python: client = OpenAI(base_url="{base_url}/v1", api_key="none"){R}',
+        "",
+        f"  {G}✓ Running on {HOST}:{PORT} (CTRL + C to quit){R}",
+        "",
+    ]
+
+    print("\n".join(lines), flush=True)
 
 
 # -------------------------
@@ -758,12 +992,46 @@ async def completions(req: CompletionsReq):
 # -------------------------
 # Main
 # -------------------------
+def _graceful_shutdown(signum=None, frame=None) -> None:
+    """Send shutdown to all workers, print exit banner, then exit."""
+    sig_name = signal.Signals(signum).name if signum else "EXIT"
+    D = "\033[2m"
+    G = "\033[1;32m"
+    R = "\033[0m"
+
+    # Tell workers to exit
+    with _worker_lock:
+        for r, sock in _worker_socks.items():
+            try:
+                send_msg(sock, {"type": "shutdown"})
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    print(f"\n{D}  [{sig_name}] Shutting down...{R}", flush=True)
+    print(f"{G}  ✓ Server stopped. GPU memory released on all nodes.{R}", flush=True)
+    print(
+        f"{D}  Tip: run 'make mem' to verify  |  'make kill-all' to force-clean{R}\n",
+        flush=True,
+    )
+
+    # Exit without raising (avoids ugly traceback on Ctrl+C)
+    os._exit(0)
+
+
 def main() -> None:
     global _model, _tok, _world
     _world = mx.distributed.init()
     _model, _tok = sharded_load_with_fallback(MODEL_DIR)
 
     if _world.rank() == 0:
+        # Register signal handlers for clean shutdown
+        signal.signal(signal.SIGINT, _graceful_shutdown)
+        signal.signal(signal.SIGTERM, _graceful_shutdown)
+
         # Mount dashboard before uvicorn starts (routes must be registered beforehand)
         if _DASHBOARD_AVAILABLE:
             _mount_dashboard_now()
@@ -776,12 +1044,24 @@ def main() -> None:
         if not rank0_wait_for_workers(_world.size(), timeout_s=60):
             raise RuntimeError("Workers did not connect to control-plane in time")
 
-        print(
-            f"[rank0] dashboard → http://{HOST if HOST != '0.0.0.0' else 'localhost'}:{PORT}/dashboard",
-            flush=True,
+        uvicorn.run(
+            app,
+            host=HOST,
+            port=PORT,
+            log_level="warning",
+            # Let our signal handler run instead of uvicorn's default
+            # (uvicorn installs its own SIGINT handler that raises SystemExit)
         )
-        uvicorn.run(app, host=HOST, port=PORT, log_level="info")
     else:
+        # Workers: exit cleanly on SIGINT/SIGTERM too
+        def _worker_exit(signum=None, frame=None):
+            rank = _world.rank() if _world else "?"
+            print(f"\n[worker {rank}] signal received — exiting.", flush=True)
+            os._exit(0)
+
+        signal.signal(signal.SIGINT, _worker_exit)
+        signal.signal(signal.SIGTERM, _worker_exit)
+
         worker_loop(_world.rank())
 
 

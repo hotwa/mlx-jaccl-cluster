@@ -157,4 +157,4 @@ echo "Starting cluster server..."
   --env CTRL_PORT="$CTRL_PORT" \
   --env QUEUE_MAX="$QUEUE_MAX" \
   --env REQ_TIMEOUT="$REQ_TIMEOUT" -- \
-  python "$SERVER_PY"
+  "$SERVER_PY"
