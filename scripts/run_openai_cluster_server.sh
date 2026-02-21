@@ -55,6 +55,23 @@ CTRL_PORT="${CTRL_PORT:-18080}"
 QUEUE_MAX="${QUEUE_MAX:-8}"
 REQ_TIMEOUT="${REQ_TIMEOUT:-120}"
 
+# Auto-detect RDMA devices from hostfile (comma-separated, one per rank)
+# Can be overridden with RDMA_DEVICES="rdma_en4,rdma_en4"
+if [[ -z "${RDMA_DEVICES:-}" ]]; then
+  RDMA_DEVICES=$(python3 -c "
+import json
+with open('$HOSTFILE') as f:
+    hosts = json.load(f)
+devs = []
+for h in hosts:
+    rdma = h.get('rdma', [])
+    # rdma is a list like [null, 'rdma_en4'] — pick the first non-null entry
+    dev = next((d for d in rdma if d), 'rdma_en4')
+    devs.append(dev)
+print(','.join(devs))
+" 2>/dev/null || echo "rdma_en4,rdma_en4")
+fi
+
 # ── Validate paths ────────────────────────────────────────────────────────────
 if [[ ! -d "$VENV_DIR" ]]; then
   error ".venv not found at $VENV_DIR\n  Run: ./scripts/setup.sh"
@@ -107,8 +124,11 @@ info "Hostfile   : $HOSTFILE"
 info "Hosts      : $HOSTS"
 info "Ctrl       : $CTRL_HOST:$CTRL_PORT"
 info "HTTP       : $HTTP_HOST:$HTTP_PORT"
+info "RDMA devs  : $RDMA_DEVICES"
 info "venv       : $VENV_DIR"
 info "mlx.launch : $MLX_LAUNCH"
+echo ""
+printf "\033[1;32m  Dashboard → http://localhost:%s/dashboard\033[0m\n" "$HTTP_PORT"
 echo ""
 
 # ── Stop any stale server processes on all nodes ──────────────────────────────
@@ -127,7 +147,9 @@ echo "Starting cluster server..."
   --env MLX_METAL_FAST_SYNCH=1 \
   --env HF_HUB_OFFLINE=1 \
   --env TRANSFORMERS_OFFLINE=1 \
+  --env PYTHONPATH="$REPO_DIR/server" \
   --env MODEL_DIR="$MODEL_DIR" \
+  --env RDMA_DEVICES="$RDMA_DEVICES" \
   --env MODEL_ID="$MODEL_ID" \
   --env HOST="$HTTP_HOST" \
   --env PORT="$HTTP_PORT" \

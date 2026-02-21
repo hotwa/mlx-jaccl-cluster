@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-import os
-import time
+import asyncio
 import json
+import os
 import socket
 import struct
+import sys
 import threading
-import asyncio
+import time
 import uuid
-from typing import Optional, Union, AsyncGenerator
+from pathlib import Path
+from typing import AsyncGenerator, Optional, Union
 
 import mlx.core as mx
-import sys
-from pathlib import Path
-from mlx_lm.utils import sharded_load, load_model
+from mlx_lm.utils import load_model, sharded_load
 
 # generate() import differs across mlx-lm branches
 try:
@@ -29,10 +29,20 @@ except ImportError:
     except ImportError:
         stream_generate = None
 
-from fastapi import FastAPI, HTTPException
-from starlette.responses import StreamingResponse
-from pydantic import BaseModel
 import uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from starlette.responses import StreamingResponse
+
+# Dashboard (optional — only mounted on rank 0)
+try:
+    from dashboard import GenerationStats, metrics_store, mount_dashboard
+
+    _DASHBOARD_AVAILABLE = True
+except ImportError:
+    _DASHBOARD_AVAILABLE = False
+    metrics_store = None
+    GenerationStats = None
 
 
 # -------------------------
@@ -40,6 +50,7 @@ import uvicorn
 # -------------------------
 class TokenizerWrapper:
     """Wrapper to handle encode kwargs that some custom tokenizers don't support."""
+
     def __init__(self, tokenizer):
         self._tok = tokenizer
 
@@ -63,7 +74,7 @@ def load_custom_tokenizer(model_path):
         mod = __import__(module_name)
         for attr in dir(mod):
             cls = getattr(mod, attr)
-            if isinstance(cls, type) and hasattr(cls, 'from_pretrained'):
+            if isinstance(cls, type) and hasattr(cls, "from_pretrained"):
                 try:
                     tok = cls.from_pretrained(model_path)
                     return TokenizerWrapper(tok)
@@ -104,11 +115,12 @@ def sharded_load_with_fallback(repo):
 MODEL_DIR = os.environ["MODEL_DIR"]  # REQUIRED
 MODEL_ID = os.environ.get("MODEL_ID", os.path.basename(MODEL_DIR.rstrip("/")))
 
-HOST = os.environ.get("HOST", "0.0.0.0")      # HTTP bind on rank0
-PORT = int(os.environ.get("PORT", "8080"))    # HTTP port on rank0
+HOST = os.environ.get("HOST", "0.0.0.0")  # HTTP bind on rank0
+PORT = int(os.environ.get("PORT", "8080"))  # HTTP port on rank0
 
 # Control-plane (rank0 <-> workers) for coordinating "everyone call generate()"
 CTRL_PORT = int(os.environ.get("CTRL_PORT", "18080"))
+
 
 def _default_ctrl_host() -> str:
     c = os.environ.get("MLX_JACCL_COORDINATOR", "")
@@ -116,23 +128,31 @@ def _default_ctrl_host() -> str:
         return c.split(":", 1)[0]
     return "macstudio1.local"
 
+
 CTRL_HOST = os.environ.get("CTRL_HOST", _default_ctrl_host())
 
 DEFAULT_MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
 
 # Backpressure / queueing
-QUEUE_MAX = int(os.environ.get("QUEUE_MAX", "8"))          # max queued requests
-REQ_TIMEOUT = float(os.environ.get("REQ_TIMEOUT", "120"))  # per request timeout (seconds)
+QUEUE_MAX = int(os.environ.get("QUEUE_MAX", "8"))  # max queued requests
+REQ_TIMEOUT = float(
+    os.environ.get("REQ_TIMEOUT", "120")
+)  # per request timeout (seconds)
 
 # -------------------------
 # Globals
 # -------------------------
-app = FastAPI()
+app = FastAPI(
+    title="mlx-jaccl-cluster",
+    description="OpenAI-compatible API for a multi-Mac MLX cluster over RDMA/Thunderbolt (JACCL)",
+    version="0.1.0",
+)
 _model = None
 _tok = None
 _world = None
 
 _queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX)  # rank0 only uses it
+
 
 # -------------------------
 # Tiny framed JSON protocol
@@ -146,10 +166,12 @@ def _recvall(sock: socket.socket, n: int) -> Optional[bytes]:
         buf += chunk
     return buf
 
+
 def send_msg(sock: socket.socket, obj: dict) -> None:
     data = json.dumps(obj).encode("utf-8")
     sock.sendall(struct.pack("!I", len(data)))
     sock.sendall(data)
+
 
 def recv_msg(sock: socket.socket) -> Optional[dict]:
     hdr = _recvall(sock, 4)
@@ -161,6 +183,7 @@ def recv_msg(sock: socket.socket) -> Optional[dict]:
         return None
     return json.loads(body.decode("utf-8"))
 
+
 # -------------------------
 # OpenAI-ish schemas
 # -------------------------
@@ -168,11 +191,13 @@ class ChatMessage(BaseModel):
     role: str
     content: str
 
+
 class ChatCompletionsReq(BaseModel):
     model: Optional[str] = None
     messages: list[ChatMessage]
     max_tokens: Optional[int] = None
     stream: Optional[bool] = False
+
 
 class CompletionsReq(BaseModel):
     model: Optional[str] = None
@@ -180,25 +205,31 @@ class CompletionsReq(BaseModel):
     max_tokens: Optional[int] = None
     stream: Optional[bool] = False
 
+
 def _build_chat_prompt(messages: list[ChatMessage]) -> str:
     # Prefer tokenizer chat template when available
     if hasattr(_tok, "apply_chat_template"):
         msgs = [{"role": m.role, "content": m.content} for m in messages]
-        return _tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        return _tok.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
 
     # Fallback: simple "ROLE: content" format
     parts = [f"{m.role.upper()}: {m.content}" for m in messages]
     parts.append("ASSISTANT:")
     return "\n".join(parts)
 
+
 def _tok_len(text: str) -> int:
     return len(_tok.encode(text))
+
 
 # -------------------------
 # Rank0 worker connections
 # -------------------------
 _worker_socks: dict[int, socket.socket] = {}  # rank -> socket
 _worker_lock = threading.Lock()
+
 
 def rank0_accept_workers(expected_world_size: int) -> None:
     """
@@ -222,6 +253,7 @@ def rank0_accept_workers(expected_world_size: int) -> None:
             _worker_socks[r] = conn
         print(f"[rank0] worker connected rank={r} from {addr}", flush=True)
 
+
 def rank0_wait_for_workers(expected_world_size: int, timeout_s: int = 60) -> bool:
     t0 = time.time()
     while True:
@@ -234,6 +266,7 @@ def rank0_wait_for_workers(expected_world_size: int, timeout_s: int = 60) -> boo
             return False
         time.sleep(0.1)
 
+
 def rank0_broadcast_task(task: dict) -> None:
     """
     Send the same task to all worker ranks (1..N-1).
@@ -242,6 +275,7 @@ def rank0_broadcast_task(task: dict) -> None:
         items = list(_worker_socks.items())
     for r, s in items:
         send_msg(s, {"type": "task", **task})
+
 
 def rank0_wait_done(expected_world_size: int) -> None:
     """
@@ -262,6 +296,7 @@ def rank0_wait_done(expected_world_size: int) -> None:
             if msg and msg.get("type") == "done":
                 done.add(r)
 
+
 # -------------------------
 # Worker loop
 # -------------------------
@@ -273,7 +308,10 @@ def worker_loop(rank: int) -> None:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((CTRL_HOST, CTRL_PORT))
     send_msg(s, {"type": "hello", "rank": rank})
-    print(f"[worker {rank}] connected to control-plane {CTRL_HOST}:{CTRL_PORT}", flush=True)
+    print(
+        f"[worker {rank}] connected to control-plane {CTRL_HOST}:{CTRL_PORT}",
+        flush=True,
+    )
 
     while True:
         msg = recv_msg(s)
@@ -288,6 +326,7 @@ def worker_loop(rank: int) -> None:
         _ = generate(_model, _tok, prompt, max_tokens=max_tokens)
         mx.eval()
         send_msg(s, {"type": "done", "rank": rank})
+
 
 # -------------------------
 # Queue worker (rank0 only)
@@ -307,14 +346,20 @@ async def _queue_worker() -> None:
             _queue.task_done()
             continue
 
-        kind, prompt, max_t, result_target, is_stream = item  # kind: "chat" | "completions"
+        kind, prompt, max_t, result_target, is_stream = (
+            item  # kind: "chat" | "completions"
+        )
         try:
             rank0_broadcast_task({"prompt": prompt, "max_tokens": max_t})
 
             if is_stream and stream_generate is not None:
                 # Streaming mode: yield chunks via async queue
                 chunk_queue: asyncio.Queue = result_target
-                req_id = f"chatcmpl-{uuid.uuid4().hex[:24]}" if kind == "chat" else f"cmpl-{uuid.uuid4().hex[:24]}"
+                req_id = (
+                    f"chatcmpl-{uuid.uuid4().hex[:24]}"
+                    if kind == "chat"
+                    else f"cmpl-{uuid.uuid4().hex[:24]}"
+                )
                 created = int(time.time())
 
                 t0 = time.time()
@@ -322,18 +367,22 @@ async def _queue_worker() -> None:
 
                 for response in stream_generate(_model, _tok, prompt, max_tokens=max_t):
                     token_count += 1
-                    token_text = response.text  # GenerationResponse.text contains the decoded text
+                    token_text = (
+                        response.text
+                    )  # GenerationResponse.text contains the decoded text
                     if kind == "chat":
                         chunk = {
                             "id": req_id,
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": MODEL_ID,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": token_text},
-                                "finish_reason": None,
-                            }],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": token_text},
+                                    "finish_reason": None,
+                                }
+                            ],
                         }
                     else:  # completions
                         chunk = {
@@ -341,17 +390,39 @@ async def _queue_worker() -> None:
                             "object": "text_completion",
                             "created": created,
                             "model": MODEL_ID,
-                            "choices": [{
-                                "index": 0,
-                                "text": token_text,
-                                "finish_reason": None,
-                                "logprobs": None,
-                            }],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "text": token_text,
+                                    "finish_reason": None,
+                                    "logprobs": None,
+                                }
+                            ],
                         }
                     await chunk_queue.put(f"data: {json.dumps(chunk)}\n\n")
 
                 mx.eval()
                 t1 = time.time()
+
+                # Record streaming stats (best-effort token count)
+                if _DASHBOARD_AVAILABLE and metrics_store is not None:
+                    elapsed = t1 - t0
+                    pt = _tok_len(prompt)
+                    asyncio.create_task(
+                        metrics_store.record_generation(
+                            GenerationStats(
+                                timestamp=t1,
+                                prompt_tokens=pt,
+                                completion_tokens=token_count,
+                                elapsed_s=round(elapsed, 3),
+                                tokens_per_sec=round(
+                                    token_count / max(elapsed, 1e-9), 1
+                                ),
+                                model_id=MODEL_ID,
+                                kind=kind,
+                            )
+                        )
+                    )
 
                 # Send final chunk with finish_reason
                 if kind == "chat":
@@ -360,11 +431,13 @@ async def _queue_worker() -> None:
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": MODEL_ID,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop",
-                        }],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
                     }
                 else:
                     final_chunk = {
@@ -372,12 +445,14 @@ async def _queue_worker() -> None:
                         "object": "text_completion",
                         "created": created,
                         "model": MODEL_ID,
-                        "choices": [{
-                            "index": 0,
-                            "text": "",
-                            "finish_reason": "stop",
-                            "logprobs": None,
-                        }],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "text": "",
+                                "finish_reason": "stop",
+                                "logprobs": None,
+                            }
+                        ],
                     }
                 await chunk_queue.put(f"data: {json.dumps(final_chunk)}\n\n")
                 await chunk_queue.put("data: [DONE]\n\n")
@@ -395,14 +470,33 @@ async def _queue_worker() -> None:
 
                 rank0_wait_done(_world.size())
 
-                completion = out_text[len(prompt):] if out_text.startswith(prompt) else out_text
+                completion = (
+                    out_text[len(prompt) :] if out_text.startswith(prompt) else out_text
+                )
                 pt = _tok_len(prompt)
                 ct = _tok_len(completion)
+                elapsed = t1 - t0
 
                 timing = {
-                    "seconds": round(t1 - t0, 3),
-                    "tokens_per_sec": round(ct / max(t1 - t0, 1e-9), 3),
+                    "seconds": round(elapsed, 3),
+                    "tokens_per_sec": round(ct / max(elapsed, 1e-9), 3),
                 }
+
+                # Record non-streaming stats
+                if _DASHBOARD_AVAILABLE and metrics_store is not None:
+                    asyncio.create_task(
+                        metrics_store.record_generation(
+                            GenerationStats(
+                                timestamp=t1,
+                                prompt_tokens=pt,
+                                completion_tokens=ct,
+                                elapsed_s=round(elapsed, 3),
+                                tokens_per_sec=timing["tokens_per_sec"],
+                                model_id=MODEL_ID,
+                                kind=kind,
+                            )
+                        )
+                    )
 
                 if kind == "chat":
                     resp = {
@@ -410,12 +504,18 @@ async def _queue_worker() -> None:
                         "object": "chat.completion",
                         "created": int(time.time()),
                         "model": MODEL_ID,
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": completion},
-                            "finish_reason": "stop",
-                        }],
-                        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": completion},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": pt,
+                            "completion_tokens": ct,
+                            "total_tokens": pt + ct,
+                        },
                         "timing": timing,
                     }
                 elif kind == "completions":
@@ -424,13 +524,19 @@ async def _queue_worker() -> None:
                         "object": "text_completion",
                         "created": int(time.time()),
                         "model": MODEL_ID,
-                        "choices": [{
-                            "index": 0,
-                            "text": completion,
-                            "finish_reason": "stop",
-                            "logprobs": None,
-                        }],
-                        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+                        "choices": [
+                            {
+                                "index": 0,
+                                "text": completion,
+                                "finish_reason": "stop",
+                                "logprobs": None,
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": pt,
+                            "completion_tokens": ct,
+                            "total_tokens": pt + ct,
+                        },
                         "timing": timing,
                     }
                 else:
@@ -439,6 +545,8 @@ async def _queue_worker() -> None:
                 fut.set_result(resp)
 
         except Exception as e:
+            if _DASHBOARD_AVAILABLE and metrics_store is not None:
+                asyncio.create_task(metrics_store.record_error())
             if is_stream:
                 chunk_queue: asyncio.Queue = result_target
                 await chunk_queue.put(f"data: {json.dumps({'error': str(e)})}\n\n")
@@ -449,11 +557,49 @@ async def _queue_worker() -> None:
         finally:
             _queue.task_done()
 
+
 @app.on_event("startup")
 async def _startup() -> None:
     # Only rank0 runs the HTTP server, so only rank0 starts the queue worker
+    # Note: dashboard is already mounted in main() before uvicorn.run() —
+    # do NOT call _mount_dashboard_now() here to avoid duplicate route registration.
     if _world and _world.rank() == 0:
         asyncio.create_task(_queue_worker())
+
+
+# -------------------------
+# Dashboard mounting helper
+# -------------------------
+def _mount_dashboard_now() -> None:
+    """Mount dashboard routes. Called on rank-0 startup after _world is set."""
+    if not _DASHBOARD_AVAILABLE:
+        return
+
+    # Detect RDMA devices from environment / hostfile heuristic
+    rdma_raw = os.environ.get("RDMA_DEVICES", "")
+    if rdma_raw:
+        rdma_devices = [d.strip() for d in rdma_raw.split(",")]
+    else:
+        # Default: both nodes use rdma_en4 (confirmed working on M4 Pro)
+        rdma_devices = ["rdma_en4"] * (_world.size() if _world else 2)
+
+    mount_dashboard(
+        app,
+        get_state=lambda: {},
+        get_queue_info=lambda: {"queue_size": _queue.qsize(), "queue_max": QUEUE_MAX},
+        model_id=MODEL_ID,
+        world_size=_world.size() if _world else 1,
+        rank=_world.rank() if _world else 0,
+        queue_max=QUEUE_MAX,
+        rdma_devices=rdma_devices,
+        host=HOST,
+        port=PORT,
+    )
+    print(
+        f"[rank0] dashboard mounted at http://{HOST if HOST != '0.0.0.0' else 'localhost'}:{PORT}/dashboard",
+        flush=True,
+    )
+
 
 # -------------------------
 # HTTP endpoints (rank0 only)
@@ -469,13 +615,16 @@ def health() -> dict:
         "queue_size": _queue.qsize(),
     }
 
+
 @app.get("/v1/models")
 def list_models() -> dict:
     return {"object": "list", "data": [{"id": MODEL_ID, "object": "model"}]}
 
+
 @app.get("/queue")
 def queue_status() -> dict:
     return {"size": _queue.qsize(), "max": QUEUE_MAX}
+
 
 async def _stream_generator(chunk_queue: asyncio.Queue) -> AsyncGenerator[str, None]:
     """Yield SSE chunks from the queue until None is received."""
@@ -489,9 +638,14 @@ async def _stream_generator(chunk_queue: asyncio.Queue) -> AsyncGenerator[str, N
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionsReq):
     if req.stream and stream_generate is None:
-        raise HTTPException(status_code=400, detail="stream=true not supported (stream_generate not available)")
+        raise HTTPException(
+            status_code=400,
+            detail="stream=true not supported (stream_generate not available)",
+        )
     if req.model and req.model != MODEL_ID:
-        raise HTTPException(status_code=400, detail=f"Only model '{MODEL_ID}' is served")
+        raise HTTPException(
+            status_code=400, detail=f"Only model '{MODEL_ID}' is served"
+        )
 
     if _world.rank() != 0:
         raise HTTPException(status_code=500, detail="Rank != 0 received HTTP request")
@@ -505,7 +659,9 @@ async def chat_completions(req: ChatCompletionsReq):
         try:
             _queue.put_nowait(("chat", prompt, max_t, chunk_queue, True))
         except asyncio.QueueFull:
-            raise HTTPException(status_code=429, detail="Server busy (queue full). Try again later.")
+            raise HTTPException(
+                status_code=429, detail="Server busy (queue full). Try again later."
+            )
 
         return StreamingResponse(
             _stream_generator(chunk_queue),
@@ -524,19 +680,27 @@ async def chat_completions(req: ChatCompletionsReq):
         try:
             _queue.put_nowait(("chat", prompt, max_t, fut, False))
         except asyncio.QueueFull:
-            raise HTTPException(status_code=429, detail="Server busy (queue full). Try again later.")
+            raise HTTPException(
+                status_code=429, detail="Server busy (queue full). Try again later."
+            )
 
         try:
             return await asyncio.wait_for(fut, timeout=REQ_TIMEOUT)
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="Request timed out")
 
+
 @app.post("/v1/completions")
 async def completions(req: CompletionsReq):
     if req.stream and stream_generate is None:
-        raise HTTPException(status_code=400, detail="stream=true not supported (stream_generate not available)")
+        raise HTTPException(
+            status_code=400,
+            detail="stream=true not supported (stream_generate not available)",
+        )
     if req.model and req.model != MODEL_ID:
-        raise HTTPException(status_code=400, detail=f"Only model '{MODEL_ID}' is served")
+        raise HTTPException(
+            status_code=400, detail=f"Only model '{MODEL_ID}' is served"
+        )
 
     if _world.rank() != 0:
         raise HTTPException(status_code=500, detail="Rank != 0 received HTTP request")
@@ -544,7 +708,10 @@ async def completions(req: CompletionsReq):
     if isinstance(req.prompt, list):
         # Keep it simple + safe for distributed mode: one prompt at a time.
         if len(req.prompt) != 1:
-            raise HTTPException(status_code=400, detail="Only a single prompt string is supported (prompt must be a string, or a list of length 1).")
+            raise HTTPException(
+                status_code=400,
+                detail="Only a single prompt string is supported (prompt must be a string, or a list of length 1).",
+            )
         prompt = req.prompt[0]
     else:
         prompt = req.prompt
@@ -557,7 +724,9 @@ async def completions(req: CompletionsReq):
         try:
             _queue.put_nowait(("completions", prompt, max_t, chunk_queue, True))
         except asyncio.QueueFull:
-            raise HTTPException(status_code=429, detail="Server busy (queue full). Try again later.")
+            raise HTTPException(
+                status_code=429, detail="Server busy (queue full). Try again later."
+            )
 
         return StreamingResponse(
             _stream_generator(chunk_queue),
@@ -576,12 +745,15 @@ async def completions(req: CompletionsReq):
         try:
             _queue.put_nowait(("completions", prompt, max_t, fut, False))
         except asyncio.QueueFull:
-            raise HTTPException(status_code=429, detail="Server busy (queue full). Try again later.")
+            raise HTTPException(
+                status_code=429, detail="Server busy (queue full). Try again later."
+            )
 
         try:
             return await asyncio.wait_for(fut, timeout=REQ_TIMEOUT)
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="Request timed out")
+
 
 # -------------------------
 # Main
@@ -592,16 +764,26 @@ def main() -> None:
     _model, _tok = sharded_load_with_fallback(MODEL_DIR)
 
     if _world.rank() == 0:
-        th = threading.Thread(target=rank0_accept_workers, args=(_world.size(),), daemon=True)
+        # Mount dashboard before uvicorn starts (routes must be registered beforehand)
+        if _DASHBOARD_AVAILABLE:
+            _mount_dashboard_now()
+
+        th = threading.Thread(
+            target=rank0_accept_workers, args=(_world.size(),), daemon=True
+        )
         th.start()
 
         if not rank0_wait_for_workers(_world.size(), timeout_s=60):
             raise RuntimeError("Workers did not connect to control-plane in time")
 
+        print(
+            f"[rank0] dashboard → http://{HOST if HOST != '0.0.0.0' else 'localhost'}:{PORT}/dashboard",
+            flush=True,
+        )
         uvicorn.run(app, host=HOST, port=PORT, log_level="info")
     else:
         worker_loop(_world.rank())
 
+
 if __name__ == "__main__":
     main()
-
