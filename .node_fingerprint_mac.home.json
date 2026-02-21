@@ -1,0 +1,16 @@
+{
+  "hostname": "mac.home",
+  "model": "Mac mini",
+  "chip": "Apple M4 Pro",
+  "memory_gb": 48,
+  "cpu_cores": "12 (8 Performance and 4 Efficiency)",
+  "macos": "26.3",
+  "mlx_version": "0.30.6",
+  "gpu": "Apple M4 Pro",
+  "architecture": "applegpu_g16s",
+  "max_wset_gb": 37.4,
+  "max_buffer_gb": 28.1,
+  "rdma_active": [
+    "rdma_en4"
+  ]
+}
