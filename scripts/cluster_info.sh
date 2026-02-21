@@ -36,13 +36,16 @@ if [[ ! -f "$VENV_PYTHON" ]]; then
 fi
 
 # ── Parse hosts from hostfile ─────────────────────────────────────────────────
-mapfile -t HOSTS < <("$VENV_PYTHON" -c "
+HOSTS=()
+while IFS= read -r _h; do
+  [[ -n "$_h" ]] && HOSTS+=("$_h")
+done <<< "$("$VENV_PYTHON" -c "
 import json
 with open('$HOSTFILE') as f:
     hosts = json.load(f)
 for h in hosts:
     print(h['ssh'])
-")
+")"
 
 NUM_HOSTS=${#HOSTS[@]}
 
