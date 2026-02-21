@@ -143,10 +143,10 @@ This checks:
 Run the minimal RDMA test to confirm actual data flows over Thunderbolt between both Macs:
 
 ```bash
-uv run mlx.launch --backend jaccl \
+.venv/bin/mlx.launch --backend jaccl \
   --hostfile hostfiles/hosts-2node.json \
   --env MLX_METAL_FAST_SYNCH=1 -- \
-  python scripts/rdma_test.py
+  scripts/rdma_test.py
 ```
 
 Expected output on rank0:
@@ -159,10 +159,11 @@ A healthy TB5 RDMA link should show **> 5 GB/s** peak bandwidth.
 
 Optional env vars:
 ```bash
-RDMA_ROUNDS=50 RDMA_VERBOSE=1 uv run mlx.launch --backend jaccl \
+RDMA_ROUNDS=50 RDMA_VERBOSE=1 \
+  .venv/bin/mlx.launch --backend jaccl \
   --hostfile hostfiles/hosts-2node.json \
   --env MLX_METAL_FAST_SYNCH=1 -- \
-  python scripts/rdma_test.py
+  scripts/rdma_test.py
 ```
 
 ---
@@ -207,12 +208,12 @@ done
 ## 8) Run the distributed tokens/sec benchmark
 
 ```bash
-uv run mlx.launch --verbose --backend jaccl \
-  --hostfile hostfiles/hosts.json \
+.venv/bin/mlx.launch --verbose --backend jaccl \
+  --hostfile hostfiles/hosts-2node.json \
   --env MLX_METAL_FAST_SYNCH=1 \
   --env HF_HUB_OFFLINE=1 \
   --env TRANSFORMERS_OFFLINE=1 -- \
-  python scripts/jaccl_tps_bench.py \
+  scripts/jaccl_tps_bench.py \
   --model "$MODEL_DIR" \
   --prompt "Write 5 sentences about Thunderbolt RDMA." \
   --max-tokens 256
