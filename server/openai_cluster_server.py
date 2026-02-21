@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import AsyncGenerator, Optional, Union
 
 import mlx.core as mx
-from mlx_lm.utils import load_model, sharded_load
+from mlx_lm.utils import load_model, load_tokenizer
 
 # generate() import differs across mlx-lm branches
 try:
@@ -87,27 +87,54 @@ def load_custom_tokenizer(model_path):
 
 
 def sharded_load_with_fallback(repo):
-    """Load model with fallback for custom tokenizers."""
+    """
+    Load and shard the model using EAGER (non-lazy) weight loading.
+
+    Why eager instead of lazy?
+      lazy=True + mx.eval(model.parameters()) triggers a distributed
+      computation graph that deadlocks in JACCL — rank 1 hangs inside
+      mx.eval() even with barriers. Eager loading materializes weights
+      from disk immediately (no mx.eval needed), then shard() just
+      redistributes the already-concrete tensors. This completely
+      sidesteps the JACCL eval deadlock.
+
+    This matches the proven approach from jaccl_tps_bench.py.
+    """
     model_path = Path(repo)
+    world = mx.distributed.init()
+    rank = world.rank()
 
-    try:
-        return sharded_load(repo)
-    except Exception as e:
-        if "tokenizer" not in str(e).lower() and "NoneType" not in str(e):
-            raise
+    # Step 1: EAGER load — weights are fully materialized from disk
+    print(f"  [rank {rank}] loading model (eager) ...", flush=True)
+    t0 = time.time()
+    model, _ = load_model(model_path, lazy=False)
+    print(f"  [rank {rank}] model loaded in {time.time() - t0:.2f}s", flush=True)
 
-    # Fallback: load model and tokenizer separately
-    tok = load_custom_tokenizer(model_path)
-    model, config = load_model(model_path, lazy=True, strict=False)
-
-    tensor_group = mx.distributed.init()
-    if hasattr(model, "shard"):
-        model.shard(tensor_group)
-
-    mx.eval(model.parameters())
-
+    # Step 2: barrier — ensure both ranks loaded before sharding
     x = mx.zeros((1,))
     mx.eval(mx.distributed.all_sum(x))
+    print(f"  [rank {rank}] pre-shard barrier done", flush=True)
+
+    # Step 3: shard
+    if hasattr(model, "shard"):
+        model.shard(world)
+        print(f"  [rank {rank}] model sharded (Tensor Parallelism)", flush=True)
+    else:
+        print(f"  [rank {rank}] no shard method — running replicated", flush=True)
+
+    # Step 4: post-shard barrier
+    mx.eval(mx.distributed.all_sum(mx.zeros((1,))))
+    print(f"  [rank {rank}] post-shard barrier done", flush=True)
+
+    # Step 5: load tokenizer
+    try:
+        tok = load_tokenizer(
+            model_path, {"trust_remote_code": True}, eos_token_ids=None
+        )
+    except Exception:
+        # Fallback for custom tokenizers
+        tok = load_custom_tokenizer(model_path)
+    print(f"  [rank {rank}] tokenizer loaded", flush=True)
 
     return model, tok
 
