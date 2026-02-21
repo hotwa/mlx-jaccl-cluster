@@ -33,7 +33,7 @@ RDMA_MAX_MB  ?= 256
 
 # ── Server defaults ──────────────────────────────────────────────────────────
 MODEL_DIR    ?=
-MODEL        ?=
+MODEL        ?= mlx-community/Qwen3-8B-4bit
 HTTP_HOST    ?= 0.0.0.0
 HTTP_PORT    ?= 8080
 CTRL_PORT    ?= 18080
