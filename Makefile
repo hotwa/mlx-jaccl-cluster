@@ -40,8 +40,11 @@ QUEUE_MAX    ?= 8
 REQ_TIMEOUT  ?= 120
 
 # ── Benchmark defaults ───────────────────────────────────────────────────────
-BENCH_PROMPT ?= "Write 5 sentences about Thunderbolt RDMA."
+BENCH_PROMPT ?= "Explain how RDMA over Thunderbolt enables distributed ML inference on Apple Silicon."
 BENCH_TOKENS ?= 256
+BENCH_RUNS   ?= 3
+BENCH_WARMUP ?= 1
+BENCH_VERBOSE ?= 0
 
 # ── Stress test defaults ─────────────────────────────────────────────────
 STRESS_ROUNDS ?= 100
@@ -166,6 +169,9 @@ ifndef MODEL_DIR
 	@printf "  Usage: MODEL_DIR=~/models_mlx/Qwen3-4B make bench\n\n"
 	@exit 1
 endif
+	BENCH_RUNS=$(BENCH_RUNS) \
+	BENCH_WARMUP=$(BENCH_WARMUP) \
+	BENCH_VERBOSE=$(BENCH_VERBOSE) \
 	$(MLX_LAUNCH) --verbose --backend jaccl \
 	  --hostfile $(HOSTFILE) \
 	  --env MLX_METAL_FAST_SYNCH=1 \
@@ -174,7 +180,9 @@ endif
 	  scripts/jaccl_tps_bench.py \
 	  --model $(MODEL_DIR) \
 	  --prompt $(BENCH_PROMPT) \
-	  --max-tokens $(BENCH_TOKENS)
+	  --max-tokens $(BENCH_TOKENS) \
+	  --runs $(BENCH_RUNS) \
+	  --warmup $(BENCH_WARMUP)
 
 # =============================================================================
 # Server
