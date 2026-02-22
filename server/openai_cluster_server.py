@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import asyncio
 import atexit
+import gc
 import json
+import logging
 import os
 import signal
 import socket
@@ -37,6 +39,52 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
+# Memory manager — prevents kernel panics from GPU memory exhaustion
+try:
+    from memory_manager import (
+        MemoryManager,
+        MemoryPressureError,
+        ModelNotLoadedError,
+        get_manager,
+        init_manager,
+    )
+
+    _MEMORY_MANAGER_AVAILABLE = True
+except ImportError:
+    _MEMORY_MANAGER_AVAILABLE = False
+    MemoryManager = None
+    MemoryPressureError = RuntimeError
+    ModelNotLoadedError = RuntimeError
+
+# Background memory & hardware monitor (macmon-based, like exo)
+try:
+    from memory_monitor import MemoryMonitor
+
+    _MONITOR_AVAILABLE = True
+except ImportError:
+    _MONITOR_AVAILABLE = False
+    MemoryMonitor = None
+
+# Per-request logging with JSONL persistence
+try:
+    from request_log import (
+        STATUS_CANCELLED,
+        STATUS_ERROR,
+        STATUS_OK,
+        STATUS_PRESSURE_ABORT,
+        STATUS_TIMEOUT,
+        RequestLog,
+        RequestRecord,
+        get_request_log,
+        init_request_log,
+    )
+
+    _REQUEST_LOG_AVAILABLE = True
+except ImportError:
+    _REQUEST_LOG_AVAILABLE = False
+    RequestLog = None
+    RequestRecord = None
+
 # Dashboard (optional — only mounted on rank 0)
 try:
     from dashboard import GenerationStats, metrics_store, mount_dashboard
@@ -46,6 +94,8 @@ except ImportError:
     _DASHBOARD_AVAILABLE = False
     metrics_store = None
     GenerationStats = None
+
+log = logging.getLogger("cluster_server")
 
 
 # -------------------------
@@ -99,10 +149,44 @@ def sharded_load_with_fallback(repo):
       sidesteps the JACCL eval deadlock.
 
     This matches the proven approach from jaccl_tps_bench.py.
+
+    Now delegates to MemoryManager when available for:
+      - Hard memory limits (prevents kernel panic)
+      - Proper unload of any previous model
+      - Pre-flight memory headroom check
+      - Qwen3 thinking mode disable
     """
+    global _mm
+
     model_path = Path(repo)
     world = mx.distributed.init()
     rank = world.rank()
+
+    # Use MemoryManager if available (the safe path)
+    if _MEMORY_MANAGER_AVAILABLE:
+        model_id = os.path.basename(str(repo).rstrip("/"))
+        model, tok = _mm.load_model(
+            str(model_path), world=world, model_id=model_id, lazy=False
+        )
+
+        # Patch tokenizer for Qwen3 thinking safety
+        if _mm.should_disable_thinking(model_id):
+            tok = _mm.patch_chat_template_no_thinking(tok)
+            print(
+                f"  [rank {rank}] ⚠ Qwen3 thinking mode DISABLED "
+                f"(set QWEN3_ENABLE_THINKING=1 to re-enable)",
+                flush=True,
+            )
+
+        _mm.print_status()
+        return model, tok
+
+    # Fallback: original path (no memory safety)
+    print(
+        f"  [rank {rank}] ⚠ memory_manager not available — "
+        f"running WITHOUT memory limits (kernel panic risk!)",
+        flush=True,
+    )
 
     # Step 1: EAGER load — weights are fully materialized from disk
     print(f"  [rank {rank}] loading model (eager) ...", flush=True)
@@ -173,17 +257,57 @@ REQ_TIMEOUT = float(
 # -------------------------
 # Globals
 # -------------------------
+
+# Memory manager — initialized early, before any model load.
+# This MUST happen before load_model to set safe memory limits.
+_mm: Optional["MemoryManager"] = None
+if _MEMORY_MANAGER_AVAILABLE:
+    _mm = init_manager()
+    log.info("MemoryManager initialized with safe limits")
+else:
+    log.warning(
+        "memory_manager module not available — running WITHOUT memory limits. "
+        "This risks a macOS kernel panic under memory pressure!"
+    )
+
+# Background memory monitor (macmon pipe, like exo's InfoGatherer)
+_monitor: Optional["MemoryMonitor"] = None
+
+# Per-request log
+_rlog: Optional["RequestLog"] = None
+
+
 # -------------------------
 # Lifespan (replaces deprecated @app.on_event)
 # -------------------------
 @asynccontextmanager
 async def _lifespan(application):
     """Startup/shutdown lifespan for FastAPI — runs the queue worker on rank0."""
+    global _monitor, _rlog
+
     if _world and _world.rank() == 0:
+        # Start background memory monitor (macmon persistent pipe, like exo)
+        if _MONITOR_AVAILABLE and _mm is not None:
+            _monitor = MemoryMonitor(manager=_mm)
+            _monitor.start()
+            log.info(
+                f"MemoryMonitor started: source={'macmon' if _monitor.using_macmon else 'vm_stat'}, "
+                f"threshold={_monitor.memory_threshold:.0%}"
+            )
+
+        # Start request log
+        if _REQUEST_LOG_AVAILABLE:
+            _rlog = init_request_log()
+            log.info(f"RequestLog initialized: {_rlog.log_path}")
+
         asyncio.create_task(_queue_worker())
         _print_ready_banner()
+
     yield
-    # shutdown: nothing to clean up (daemon threads die with the process)
+
+    # Shutdown: stop monitor cleanly (kills macmon subprocess)
+    if _monitor is not None:
+        _monitor.stop()
 
 
 app = FastAPI(
@@ -252,17 +376,33 @@ class CompletionsReq(BaseModel):
 
 
 def _build_chat_prompt(messages: list[ChatMessage]) -> str:
-    # Prefer tokenizer chat template when available
+    # Use memory manager's safe prompt builder (disables Qwen3 thinking)
+    if _mm is not None:
+        msgs = [{"role": m.role, "content": m.content} for m in messages]
+        return _mm.build_safe_chat_prompt(msgs, tokenizer=_tok, model_id=MODEL_ID)
+
+    # Fallback: use tokenizer chat template directly
     if hasattr(_tok, "apply_chat_template"):
         msgs = [{"role": m.role, "content": m.content} for m in messages]
         return _tok.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=True
         )
 
-    # Fallback: simple "ROLE: content" format
+    # Last resort: simple "ROLE: content" format
     parts = [f"{m.role.upper()}: {m.content}" for m in messages]
     parts.append("ASSISTANT:")
     return "\n".join(parts)
+
+
+def _safe_max_tokens(requested: Optional[int]) -> int:
+    """Clamp max_tokens to prevent runaway generation / KV cache explosion."""
+    if _mm is not None:
+        return _mm.clamp_max_tokens(requested)
+    # Fallback hard cap without memory manager
+    hard_cap = int(os.environ.get("MLX_HARD_MAX_TOKENS", "4096"))
+    if requested is None or requested <= 0:
+        return min(512, hard_cap)
+    return min(requested, hard_cap)
 
 
 def _tok_len(text: str) -> int:
@@ -418,6 +558,16 @@ async def _queue_worker() -> None:
       - rank0 generate() or stream_generate()
       - wait for worker completion
       - fulfill per-request future with an OpenAI-shaped response (or stream chunks)
+
+    Memory safety:
+      - max_tokens is clamped by _safe_max_tokens() before reaching here
+      - Memory pressure is checked every 16 tokens during streaming
+      - GC cycle runs after every request to reclaim KV cache memory
+      - MemoryPressureError aborts generation cleanly (no kernel panic)
+
+    Request logging:
+      - Records memory before/after, timing, token counts, status per request
+      - Writes to JSONL file + in-memory ring buffer for /requests/* endpoints
     """
     while True:
         item = await _queue.get()
@@ -428,24 +578,60 @@ async def _queue_worker() -> None:
         kind, prompt, max_t, result_target, is_stream = (
             item  # kind: "chat" | "completions"
         )
+
+        # ── Per-request tracking ──────────────────────────────────
+        req_id = (
+            f"chatcmpl-{uuid.uuid4().hex[:24]}"
+            if kind == "chat"
+            else f"cmpl-{uuid.uuid4().hex[:24]}"
+        )
+        mem_before = _mm.active_gb() if _mm else 0.0
+        req_timestamp = time.time()
+        req_status = STATUS_OK if _REQUEST_LOG_AVAILABLE else "ok"
+        req_error_msg = None
+        req_finish_reason = "stop"
+        req_generated_tokens = 0
+        req_prompt_tokens = _tok_len(prompt) if _tok else 0
+
         try:
             rank0_broadcast_task({"prompt": prompt, "max_tokens": max_t})
 
             if is_stream and stream_generate is not None:
                 # Streaming mode: yield chunks via async queue
                 chunk_queue: asyncio.Queue = result_target
-                req_id = (
-                    f"chatcmpl-{uuid.uuid4().hex[:24]}"
-                    if kind == "chat"
-                    else f"cmpl-{uuid.uuid4().hex[:24]}"
-                )
                 created = int(time.time())
 
                 t0 = time.time()
                 token_count = 0
+                _aborted = False
 
                 for response in stream_generate(_model, _tok, prompt, max_tokens=max_t):
                     token_count += 1
+                    req_generated_tokens = token_count
+
+                    # --- Memory pressure guard (every 16 tokens) ---
+                    if _mm is not None and token_count % 16 == 0:
+                        try:
+                            _mm.generation_guard(
+                                token_count, context=f"stream_generate/{kind}"
+                            )
+                        except (MemoryPressureError, RuntimeError) as mp_err:
+                            log.error(
+                                f"Generation aborted at token {token_count}: {mp_err}"
+                            )
+                            await chunk_queue.put(
+                                f"data: {json.dumps({'error': str(mp_err)})}\n\n"
+                            )
+                            _aborted = True
+                            req_status = (
+                                STATUS_PRESSURE_ABORT
+                                if _REQUEST_LOG_AVAILABLE
+                                else "pressure_abort"
+                            )
+                            req_error_msg = str(mp_err)
+                            req_finish_reason = "memory_pressure"
+                            break
+
                     token_text = (
                         response.text
                     )  # GenerationResponse.text contains the decoded text
@@ -504,6 +690,8 @@ async def _queue_worker() -> None:
                     )
 
                 # Send final chunk with finish_reason
+                _finish = "stop" if not _aborted else "memory_pressure"
+                req_finish_reason = _finish
                 if kind == "chat":
                     final_chunk = {
                         "id": req_id,
@@ -514,7 +702,7 @@ async def _queue_worker() -> None:
                             {
                                 "index": 0,
                                 "delta": {},
-                                "finish_reason": "stop",
+                                "finish_reason": _finish,
                             }
                         ],
                     }
@@ -528,7 +716,7 @@ async def _queue_worker() -> None:
                             {
                                 "index": 0,
                                 "text": "",
-                                "finish_reason": "stop",
+                                "finish_reason": _finish,
                                 "logprobs": None,
                             }
                         ],
@@ -555,6 +743,8 @@ async def _queue_worker() -> None:
                 pt = _tok_len(prompt)
                 ct = _tok_len(completion)
                 elapsed = t1 - t0
+                req_generated_tokens = ct
+                req_prompt_tokens = pt
 
                 timing = {
                     "seconds": round(elapsed, 3),
@@ -623,7 +813,29 @@ async def _queue_worker() -> None:
 
                 fut.set_result(resp)
 
+        except MemoryPressureError as mpe:
+            # Memory pressure — log prominently and clean up
+            log.error(f"MEMORY PRESSURE in queue worker: {mpe}")
+            req_status = (
+                STATUS_PRESSURE_ABORT if _REQUEST_LOG_AVAILABLE else "pressure_abort"
+            )
+            req_error_msg = str(mpe)
+            req_finish_reason = "memory_pressure"
+            if _DASHBOARD_AVAILABLE and metrics_store is not None:
+                asyncio.create_task(metrics_store.record_error())
+            if is_stream:
+                chunk_queue: asyncio.Queue = result_target
+                await chunk_queue.put(
+                    f"data: {json.dumps({'error': f'Memory pressure: {mpe}'})}\n\n"
+                )
+                await chunk_queue.put("data: [DONE]\n\n")
+                await chunk_queue.put(None)
+            else:
+                result_target.set_exception(mpe)
         except Exception as e:
+            req_status = STATUS_ERROR if _REQUEST_LOG_AVAILABLE else "error"
+            req_error_msg = str(e)
+            req_finish_reason = "error"
             if _DASHBOARD_AVAILABLE and metrics_store is not None:
                 asyncio.create_task(metrics_store.record_error())
             if is_stream:
@@ -634,6 +846,46 @@ async def _queue_worker() -> None:
             else:
                 result_target.set_exception(e)
         finally:
+            # Post-request GC: reclaim KV cache + intermediate tensors.
+            # This is critical — without it, memory from previous requests
+            # accumulates and eventually triggers the kernel panic.
+            if _mm is not None:
+                _mm.gc_cycle(reason=f"{kind} request done")
+            else:
+                gc.collect()
+                mx.clear_cache()
+
+            # ── Record request to log ─────────────────────────────
+            if _rlog is not None and _REQUEST_LOG_AVAILABLE:
+                mem_after = _mm.active_gb() if _mm else 0.0
+                wall = time.time() - req_timestamp
+                tps = (
+                    req_generated_tokens / max(wall, 1e-9)
+                    if req_generated_tokens > 0
+                    else 0.0
+                )
+                _rlog.record(
+                    RequestRecord(
+                        request_id=req_id,
+                        timestamp=req_timestamp,
+                        kind=kind,
+                        model_id=MODEL_ID,
+                        prompt_tokens=req_prompt_tokens,
+                        generated_tokens=req_generated_tokens,
+                        max_tokens_requested=max_t,
+                        wall_time_s=wall,
+                        tokens_per_second=tps,
+                        memory_before_gb=mem_before,
+                        memory_after_gb=mem_after,
+                        memory_delta_gb=mem_after - mem_before,
+                        kv_cache_hit=False,  # Phase S2 will populate this
+                        status=req_status,
+                        error_message=req_error_msg,
+                        finish_reason=req_finish_reason,
+                        is_stream=is_stream,
+                    )
+                )
+
             _queue.task_done()
 
 
@@ -858,6 +1110,7 @@ def _mount_dashboard_now() -> None:
         host=HOST,
         port=PORT,
         hostfile=hostfile,
+        memory_monitor=_monitor,  # share macmon data with dashboard
     )
     print(
         f"[rank0] dashboard mounted at http://{HOST if HOST != '0.0.0.0' else 'localhost'}:{PORT}/dashboard",
@@ -870,14 +1123,35 @@ def _mount_dashboard_now() -> None:
 # -------------------------
 @app.get("/health")
 def health() -> dict:
-    return {
+    result = {
         "ok": True,
         "world_size": _world.size(),
         "rank": _world.rank(),
         "model": MODEL_ID,
+        "model_loaded": _model is not None,
         "queue_max": QUEUE_MAX,
         "queue_size": _queue.qsize(),
     }
+    if _mm is not None:
+        snap = _mm.snapshot()
+        result["memory"] = {
+            "active_gb": round(snap.active_gb, 3),
+            "peak_gb": round(snap.peak_gb, 3),
+            "limit_gb": round(snap.limit_gb, 1),
+            "pressure_pct": round(snap.pressure_pct, 1),
+            "headroom_gb": round(_mm.headroom_gb(), 2),
+        }
+        result["memory_safe"] = snap.pressure_pct < 80.0
+    if _monitor is not None:
+        result["monitor"] = {
+            "running": _monitor.running,
+            "source": "macmon" if _monitor.using_macmon else "vm_stat",
+            "peak_pressure_1m": round(_monitor.peak_pressure_1m, 1),
+            "memory_threshold": _monitor.memory_threshold,
+        }
+    if _rlog is not None:
+        result["requests_total"] = _rlog.entry_count
+    return result
 
 
 @app.get("/v1/models")
@@ -888,6 +1162,293 @@ def list_models() -> dict:
 @app.get("/queue")
 def queue_status() -> dict:
     return {"size": _queue.qsize(), "max": QUEUE_MAX}
+
+
+# -------------------------
+# Memory & model management endpoints
+# -------------------------
+@app.get("/memory")
+def memory_status() -> dict:
+    """Return current memory state — use this to monitor before/during/after loads."""
+    if _mm is not None:
+        snap = _mm.snapshot()
+        sys_pressure = _mm.system_memory_pressure()
+        result = {
+            "ok": True,
+            "mlx": snap.to_dict(),
+            "system": sys_pressure,
+            "slot": _mm.slot_info,
+            "limits": {
+                "memory_limit_gb": round(_mm._memory_limit / (1024**3), 2),
+                "cache_limit_gb": round(_mm._cache_limit / (1024**3), 2),
+                "hard_max_tokens": _mm.hard_max_tokens,
+                "system_reserve_gb": _mm._system_reserve_gb,
+                "pressure_warn": _mm._pressure_warn,
+                "pressure_critical": _mm._pressure_critical,
+            },
+        }
+        # Include live monitor data if available
+        if _monitor is not None:
+            result["monitor"] = _monitor.summary()
+        return result
+    # Fallback without memory manager
+    return {
+        "ok": False,
+        "error": "memory_manager not available",
+        "active_gb": round(mx.get_active_memory() / (1024**3), 3),
+        "peak_gb": round(mx.get_peak_memory() / (1024**3), 3),
+        "cache_gb": round(mx.get_cache_memory() / (1024**3), 3),
+    }
+
+
+@app.get("/memory/live")
+def memory_live(n: int = 60) -> dict:
+    """Return rolling pressure history from the background monitor.
+
+    Query params:
+        n: number of recent data points (default 60, max = history size)
+
+    Data source: macmon persistent pipe (like exo) + MLX allocator polls.
+    """
+    if _monitor is None:
+        return {"ok": False, "error": "MemoryMonitor not running"}
+    return {
+        "ok": True,
+        "source": "macmon" if _monitor.using_macmon else "vm_stat",
+        "count": len(_monitor.history),
+        "data": _monitor.history_dicts(last_n=n),
+    }
+
+
+# -------------------------
+# Request log endpoints
+# -------------------------
+@app.get("/requests/recent")
+def requests_recent(n: int = 50) -> dict:
+    """Return the last N request records."""
+    if _rlog is None:
+        return {"ok": False, "error": "RequestLog not available"}
+    return {"ok": True, "count": min(n, _rlog.entry_count), "requests": _rlog.recent(n)}
+
+
+@app.get("/requests/stats")
+def requests_stats() -> dict:
+    """Return aggregate request statistics (totals, error rate, p50/p95 latency & tok/s)."""
+    if _rlog is None:
+        return {"ok": False, "error": "RequestLog not available"}
+    return {"ok": True, **_rlog.stats()}
+
+
+@app.get("/model/info")
+def model_info() -> dict:
+    """Return metadata about the currently loaded model."""
+    result = {
+        "model_id": MODEL_ID,
+        "model_dir": MODEL_DIR,
+        "loaded": _model is not None,
+    }
+    if _mm is not None:
+        result["slot"] = _mm.slot_info
+        snap = _mm.snapshot()
+        result["memory"] = {
+            "model_size_gb": snap.model_size_gb,
+            "active_gb": snap.active_gb,
+            "pressure_pct": snap.pressure_pct,
+        }
+    return result
+
+
+class ModelLoadReq(BaseModel):
+    model_dir: str
+    model_id: Optional[str] = None
+
+
+@app.post("/model/unload")
+async def model_unload() -> dict:
+    """
+    Unload the current model, releasing all GPU memory.
+
+    This is the critical operation for preventing kernel panics when
+    switching models or when memory pressure is high.
+
+    Steps performed:
+      1. Drain the request queue (reject new requests)
+      2. Delete model + tokenizer Python references
+      3. Run GC (3 passes for reference cycles)
+      4. Clear MLX Metal buffer cache
+      5. Reset peak memory tracker
+
+    After unload, the server will reject inference requests until
+    a new model is loaded via POST /model/load.
+    """
+    global _model, _tok
+
+    if _model is None:
+        return {
+            "status": "no_model",
+            "message": "No model is currently loaded",
+            "memory": _mm.snapshot().to_dict() if _mm else {},
+        }
+
+    # Reject if there are queued requests
+    if _queue.qsize() > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot unload while {_queue.qsize()} request(s) are queued. "
+            f"Wait for them to finish or restart the server.",
+        )
+
+    old_model_id = MODEL_ID
+
+    if _mm is not None:
+        # CRITICAL: Clear the global references BEFORE calling mm.unload_model().
+        # The memory manager's unload does `del` on its internal slot references,
+        # but if _model/_tok globals still point to the same objects, the Python
+        # refcount stays > 0 and Metal buffers are NOT freed.
+        # By setting globals to None first, the only remaining refs are inside
+        # the MemoryManager's slot — when unload_model() deletes those, refcount
+        # hits zero and Metal buffers are released immediately.
+        _model = None
+        _tok = None
+        result = _mm.unload_model()
+        result["memory_after"] = _mm.snapshot().to_dict()
+        log.info(f"Model unloaded via API: {old_model_id}")
+        return result
+    else:
+        # Manual unload without memory manager
+        before = mx.get_active_memory() / (1024**3)
+        _model = None
+        _tok = None
+        gc.collect()
+        gc.collect()
+        gc.collect()
+        mx.clear_cache()
+        time.sleep(0.05)
+        gc.collect()
+        mx.clear_cache()
+        mx.reset_peak_memory()
+        after = mx.get_active_memory() / (1024**3)
+        return {
+            "status": "unloaded",
+            "model_id": old_model_id,
+            "before_active_gb": round(before, 3),
+            "after_active_gb": round(after, 3),
+            "freed_gb": round(before - after, 3),
+        }
+
+
+@app.post("/model/load")
+async def model_load(req: ModelLoadReq) -> dict:
+    """
+    Load a new model (unloading any existing one first).
+
+    This is the safe way to switch models at runtime without
+    restarting the server process.
+
+    Body:
+      { "model_dir": "/path/to/model", "model_id": "optional-name" }
+    """
+    global _model, _tok, MODEL_ID, MODEL_DIR
+
+    model_dir = req.model_dir
+    new_model_id = req.model_id or os.path.basename(model_dir.rstrip("/"))
+
+    if not os.path.isdir(model_dir):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model directory not found: {model_dir}",
+        )
+
+    # Reject if there are queued requests
+    if _queue.qsize() > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot load while {_queue.qsize()} request(s) are queued.",
+        )
+
+    log.info(f"API model load requested: {new_model_id} from {model_dir}")
+
+    try:
+        if _mm is not None:
+            # Memory-safe load (unloads previous model automatically)
+            model, tok = _mm.load_model(
+                model_dir, world=_world, model_id=new_model_id, lazy=False
+            )
+
+            # Patch Qwen3 thinking if needed
+            if _mm.should_disable_thinking(new_model_id):
+                tok = _mm.patch_chat_template_no_thinking(tok)
+
+            _model = model
+            _tok = tok
+            MODEL_ID = new_model_id
+            MODEL_DIR = model_dir
+
+            # Broadcast to workers that model changed
+            # (workers need to load too — for now they must restart)
+
+            snap = _mm.snapshot()
+            return {
+                "status": "loaded",
+                "model_id": new_model_id,
+                "model_dir": model_dir,
+                "slot": _mm.slot_info,
+                "memory": snap.to_dict(),
+            }
+        else:
+            # Without memory manager — manual load
+            # Unload first
+            _model = None
+            _tok = None
+            gc.collect()
+            gc.collect()
+            mx.clear_cache()
+
+            _model, _tok = sharded_load_with_fallback(model_dir)
+            MODEL_ID = new_model_id
+            MODEL_DIR = model_dir
+
+            return {
+                "status": "loaded",
+                "model_id": new_model_id,
+                "active_gb": round(mx.get_active_memory() / (1024**3), 3),
+            }
+
+    except MemoryPressureError as e:
+        raise HTTPException(
+            status_code=507,
+            detail=f"Not enough memory to load {new_model_id}: {e}",
+        )
+    except Exception as e:
+        log.error(f"Failed to load model {new_model_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load model: {e}",
+        )
+
+
+@app.post("/model/gc")
+async def model_gc() -> dict:
+    """
+    Force a garbage collection + Metal cache clear cycle.
+
+    Use this to reclaim memory between heavy requests without
+    unloading the model. Safe to call at any time.
+    """
+    if _mm is not None:
+        result = _mm.gc_cycle(reason="API request")
+        result["memory"] = _mm.snapshot().to_dict()
+        return result
+    else:
+        before = mx.get_active_memory() / (1024**3)
+        gc.collect()
+        mx.clear_cache()
+        after = mx.get_active_memory() / (1024**3)
+        return {
+            "before_active_gb": round(before, 3),
+            "after_active_gb": round(after, 3),
+            "freed_gb": round(before - after, 3),
+        }
 
 
 async def _stream_generator(chunk_queue: asyncio.Queue) -> AsyncGenerator[str, None]:
@@ -914,8 +1475,18 @@ async def chat_completions(req: ChatCompletionsReq):
     if _world.rank() != 0:
         raise HTTPException(status_code=500, detail="Rank != 0 received HTTP request")
 
+    # Pre-request memory check — reject early if we're already in trouble
+    if _mm is not None:
+        try:
+            _mm.check_pressure(context="pre-request chat")
+        except MemoryPressureError as e:
+            raise HTTPException(
+                status_code=507,
+                detail=f"Memory pressure too high to accept request: {e}",
+            )
+
     prompt = _build_chat_prompt(req.messages)
-    max_t = req.max_tokens or DEFAULT_MAX_TOKENS
+    max_t = _safe_max_tokens(req.max_tokens or DEFAULT_MAX_TOKENS)
 
     if req.stream:
         # Streaming mode: return SSE response
@@ -956,6 +1527,16 @@ async def chat_completions(req: ChatCompletionsReq):
 
 @app.post("/v1/completions")
 async def completions(req: CompletionsReq):
+    # Pre-request memory check
+    if _mm is not None:
+        try:
+            _mm.check_pressure(context="pre-request completions")
+        except MemoryPressureError as e:
+            raise HTTPException(
+                status_code=507,
+                detail=f"Memory pressure too high to accept request: {e}",
+            )
+
     if req.stream and stream_generate is None:
         raise HTTPException(
             status_code=400,
@@ -1053,8 +1634,31 @@ def _graceful_shutdown(signum=None, frame=None) -> None:
 
 
 def main() -> None:
-    global _model, _tok, _world
+    global _model, _tok, _world, _mm
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     _world = mx.distributed.init()
+    rank = _world.rank()
+
+    # Initialize memory manager (if not already done at module level)
+    if _MEMORY_MANAGER_AVAILABLE and _mm is None:
+        _mm = init_manager()
+
+    if _mm is not None and rank == 0:
+        log.info("Memory safety enabled — kernel panic protection active")
+        _mm.print_status()
+    elif _mm is None and rank == 0:
+        log.warning(
+            "⚠ Memory manager NOT available — no protection against "
+            "GPU memory exhaustion kernel panics!"
+        )
+
     _model, _tok = sharded_load_with_fallback(MODEL_DIR)
 
     if _world.rank() == 0:

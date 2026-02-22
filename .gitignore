@@ -20,3 +20,9 @@ hostfiles/hosts.json
 __pycache__/
 *.pyc
 *.token
+
+# Reference repos
+refs/
+
+# Request logs
+logs/

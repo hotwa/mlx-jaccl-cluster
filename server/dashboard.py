@@ -28,7 +28,10 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, Callable, Optional
+from typing import TYPE_CHECKING, AsyncGenerator, Callable, Optional
+
+if TYPE_CHECKING:
+    from memory_monitor import MemoryMonitor
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -1466,18 +1469,63 @@ pollMetrics();
 
 async def _metrics_event_generator(
     get_queue_info: Callable[[], dict],
+    monitor: Optional["MemoryMonitor"] = None,
     interval: float = 2.0,
 ) -> AsyncGenerator[str, None]:
-    """Yields SSE events with merged metrics + queue info + hardware every `interval` seconds."""
+    """Yields SSE events with merged metrics + queue info + hardware every `interval` seconds.
+
+    When a MemoryMonitor is provided, its macmon data is used for the local
+    node (avoiding a duplicate macmon subprocess).  The HardwarePoller still
+    handles remote nodes via SSH.
+    """
     while True:
         try:
             snap = await metrics_store.snapshot()
             qi = get_queue_info()
             snap.update(qi)
 
-            # Include hardware metrics if poller is running
+            # Include hardware metrics — prefer monitor for local node
             if hw_poller is not None:
-                snap["hardware"] = hw_poller.snapshot()
+                hw_data = hw_poller.snapshot()
+
+                # If monitor is running, overlay its macmon data for the local node
+                # (fresher, and avoids a duplicate macmon subprocess)
+                if monitor is not None and monitor.running:
+                    local_hw = monitor.hardware_dict()
+                    if local_hw is not None:
+                        local_hostname = socket.gethostname()
+                        # Find the local node key in hw_data and replace it
+                        replaced = False
+                        for key in list(hw_data.keys()):
+                            key_base = key.lower().split(".")[0]
+                            local_base = local_hostname.lower().split(".")[0]
+                            if key_base == local_base or key in (
+                                "localhost",
+                                "127.0.0.1",
+                                local_hostname,
+                            ):
+                                hw_data[key] = local_hw
+                                replaced = True
+                                break
+                        if not replaced and local_hostname not in hw_data:
+                            hw_data[local_hostname] = local_hw
+
+                snap["hardware"] = hw_data
+
+            # Include live memory monitor summary if available
+            if monitor is not None and monitor.running:
+                snap["memory_monitor"] = {
+                    "source": "macmon" if monitor.using_macmon else "vm_stat",
+                    "peak_pressure_1m": round(monitor.peak_pressure_1m, 1),
+                    "avg_pressure_1m": round(monitor.avg_pressure_1m, 1),
+                    "threshold": monitor.memory_threshold,
+                }
+                mlx = monitor.latest_mlx
+                if mlx is not None:
+                    snap["memory_monitor"]["mlx_active_gb"] = round(mlx.active_gb, 3)
+                    snap["memory_monitor"]["mlx_pressure_pct"] = round(
+                        mlx.pressure_pct, 1
+                    )
 
             yield f"data: {json.dumps(snap)}\n\n"
         except asyncio.CancelledError:
@@ -1505,6 +1553,7 @@ def mount_dashboard(
     host: str = "0.0.0.0",
     port: int = 8080,
     hostfile: str = "",
+    memory_monitor: Optional["MemoryMonitor"] = None,
 ) -> None:
     """
     Mount dashboard routes onto an existing FastAPI app.
@@ -1522,6 +1571,10 @@ def mount_dashboard(
     host           : bind host
     port           : HTTP port
     hostfile       : path to hostfile for node info + hw polling
+    memory_monitor : optional MemoryMonitor instance — when provided, the
+                     dashboard uses its macmon data for the local node instead
+                     of spawning its own macmon subprocess (avoids duplicate
+                     macmon processes, matches exo's single-source pattern)
     """
     global hw_poller
 
@@ -1570,7 +1623,9 @@ def mount_dashboard(
         """SSE endpoint — pushes metrics + hardware JSON every 2.5s."""
 
         async def event_gen():
-            async for event in _metrics_event_generator(get_queue_info):
+            async for event in _metrics_event_generator(
+                get_queue_info, monitor=memory_monitor
+            ):
                 if await request.is_disconnected():
                     break
                 yield event
@@ -1593,4 +1648,15 @@ def mount_dashboard(
         snap.update(qi)
         if hw_poller is not None:
             snap["hardware"] = hw_poller.snapshot()
+        if memory_monitor is not None and memory_monitor.running:
+            snap["memory_monitor"] = {
+                "source": "macmon" if memory_monitor.using_macmon else "vm_stat",
+                "peak_pressure_1m": round(memory_monitor.peak_pressure_1m, 1),
+                "avg_pressure_1m": round(memory_monitor.avg_pressure_1m, 1),
+                "threshold": memory_monitor.memory_threshold,
+            }
+            mlx = memory_monitor.latest_mlx
+            if mlx is not None:
+                snap["memory_monitor"]["mlx_active_gb"] = round(mlx.active_gb, 3)
+                snap["memory_monitor"]["mlx_pressure_pct"] = round(mlx.pressure_pct, 1)
         return snap
