@@ -3,6 +3,7 @@ import asyncio
 import atexit
 import gc
 import json
+import re
 import logging
 import os
 import signal
@@ -354,11 +355,38 @@ def recv_msg(sock: socket.socket) -> Optional[dict]:
 
 
 # -------------------------
-# OpenAI-ish schemas
+# OpenAI-ish schemas (+ tools MVP)
 # -------------------------
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str  # JSON string (OpenAI-style)
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: ToolCallFunction
+
+
+class ToolDefinitionFunction(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: dict  # JSON Schema
+
+
+class ToolDefinition(BaseModel):
+    type: str = "function"
+    function: ToolDefinitionFunction
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+
+    # OpenAI tool calling fields (subset)
+    name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[list[ToolCall]] = None
 
 
 class ChatCompletionsReq(BaseModel):
@@ -366,6 +394,10 @@ class ChatCompletionsReq(BaseModel):
     messages: list[ChatMessage]
     max_tokens: Optional[int] = None
     stream: Optional[bool] = False
+
+    # Tool calling (MVP: non-streaming only)
+    tools: Optional[list[ToolDefinition]] = None
+    tool_choice: Optional[Union[str, dict]] = None  # "auto" | "none" | {"type":"function","function":{"name":...}}
 
 
 class CompletionsReq(BaseModel):
@@ -375,7 +407,515 @@ class CompletionsReq(BaseModel):
     stream: Optional[bool] = False
 
 
-def _build_chat_prompt(messages: list[ChatMessage]) -> str:
+# -------------------------
+# Tool calling helpers (MVP)
+# -------------------------
+_TOOL_JSON_MODE_INSTRUCTION = """You are a tool-calling assistant.
+
+You MUST respond with exactly one JSON object and nothing else.
+
+Choose ONE of these shapes:
+
+1) To call tools:
+{
+  "tool_calls": [
+    {
+      "id": "call_abc123",
+      "type": "function",
+      "function": {
+        "name": "<tool_name>",
+        "arguments": { ... JSON arguments ... }
+      }
+    }
+  ]
+}
+
+2) To answer normally (no tool call):
+{
+  "content": "<final answer as a string>"
+}
+
+Rules:
+- Do not wrap the JSON in markdown fences.
+- If tool_choice is "none", you MUST return {"content": "..."}.
+- If tool_choice forces a specific function name, you MUST call that function.
+- If you call tools, arguments MUST be a JSON object (not a string).
+"""
+
+_MODEL_STOP_MARKERS = (
+    "<|user|>",
+    "<|assistant|>",
+    "<|system|>",
+    "<|observation|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "[gMASK]",
+    "[sMASK]",
+    "[MASK]",
+    "<sop>",
+    "<eop>",
+    "<|begin_of_image|>",
+    "<|end_of_image|>",
+    "<|begin_of_video|>",
+    "<|end_of_video|>",
+    "<|begin_of_audio|>",
+    "<|end_of_audio|>",
+    "<|begin_of_transcription|>",
+    "<|end_of_transcription|>",
+)
+
+_STRIP_STRUCTURED_REASONING = (
+    os.environ.get("MLX_STRIP_STRUCTURED_REASONING", "1") == "1"
+)
+
+
+def _strip_structured_reasoning_preamble(text: str) -> str:
+    """
+    Some models output "analysis steps + final answer" in plain text (without
+    <think> tags), which Cherry cannot separate. Strip common structured
+    reasoning preambles and keep the final answer part.
+    """
+    if not text:
+        return text
+    s = text.strip()
+
+    # Chinese/English markers that usually indicate chain-of-thought blocks.
+    has_reasoning_markers = any(
+        k in s
+        for k in (
+            "分析用户输入",
+            "识别核心实体",
+            "确定事实",
+            "检查约束条件",
+            "构思回复",
+            "最终润色",
+            "Analyze the user's input",
+            "Determine the intent",
+            "Final Output",
+        )
+    )
+    if not has_reasoning_markers:
+        return s
+
+    # Prefer content after explicit "final polish/output" anchors.
+    for pat in (
+        r"(?:最终润色|最终输出|Final Polish|Final Output Generation)\s*[:：]\s*",
+        r"(?:最终答案|Final Answer)\s*[:：]\s*",
+    ):
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if m:
+            tail = s[m.end() :].strip()
+            if tail:
+                # If there are quoted candidates, keep the last quoted sentence.
+                quoted = re.findall(r"[“\"]([^”\"]{2,300})[”\"]", tail)
+                if quoted:
+                    return quoted[-1].strip()
+                return tail
+
+    # Fallback: keep last non-empty line that looks like a final sentence.
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    if lines:
+        return lines[-1]
+    return s
+
+
+def _sanitize_assistant_output(text: str) -> str:
+    """
+    Normalize model output for OpenAI-compatible clients:
+    - remove reasoning blocks (<think>...</think>)
+    - trim at role/control markers (<|user|> etc.)
+    """
+    if not text:
+        return ""
+
+    s = text
+    s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r"</?think>", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"</?tool_response>", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"</?tools>", "", s, flags=re.IGNORECASE)
+    s = re.sub(
+        r"^(?:\s*(?:<\|assistant\|>|<\|system\|>|<\|user\|>|<\|observation\|>))+",
+        "",
+        s,
+    )
+    s = re.sub(r"^(?:\s*</think>\s*)+", "", s, flags=re.IGNORECASE)
+
+    # In streaming, model may emit an open <think> before the closing tag arrives.
+    # Hide reasoning content until closure appears.
+    low = s.lower()
+    open_idx = low.rfind("<think>")
+    close_idx = low.rfind("</think>")
+    if open_idx != -1 and close_idx < open_idx:
+        s = s[:open_idx]
+
+    for marker in _MODEL_STOP_MARKERS:
+        idx = s.find(marker)
+        if idx != -1:
+            s = s[:idx]
+            break
+
+    if _STRIP_STRUCTURED_REASONING:
+        s = _strip_structured_reasoning_preamble(s)
+
+    return s.strip()
+
+
+def _contains_model_stop_marker(text: str) -> bool:
+    return any(marker in text for marker in _MODEL_STOP_MARKERS)
+
+
+def _extract_json_obj(text: str) -> dict:
+    """Best-effort extraction of a JSON object from model output.
+
+    Handles:
+    - leading/trailing text
+    - markdown fences
+    - accidental prefix like 'json:' or '```json'
+    """
+    if not text:
+        raise ValueError("empty model output")
+
+    s = text.strip()
+
+    # Strip markdown fences if present
+    if s.startswith("```"):
+        # remove first fence line
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", s)
+        s = re.sub(r"\n```\s*$", "", s).strip()
+
+    # If the output includes extra text, scan for first '{' and parse with brace matching
+    start = s.find("{")
+    if start == -1:
+        raise ValueError("no '{' found in output")
+
+    # brace matching to find a complete JSON object
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":  # escape
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start : i + 1]
+                    return json.loads(candidate)
+
+    raise ValueError("unterminated JSON object")
+
+
+def _inject_tool_calling_prompt(
+    messages: list[ChatMessage],
+    tools: list[ToolDefinition],
+    tool_choice: Optional[Union[str, dict]],
+) -> str:
+    """Build a single text prompt that instructs the model to emit tool JSON."""
+    # Tools block (as JSON schema-ish)
+    tools_payload = [
+        {
+            "type": t.type,
+            "function": {
+                "name": t.function.name,
+                "description": t.function.description,
+                "parameters": t.function.parameters,
+            },
+        }
+        for t in tools
+    ]
+
+    forced = tool_choice or "auto"
+    # Normalize tool_choice: allow {"type":"function","function":{"name":...}}
+    forced_name = None
+    if isinstance(forced, dict):
+        try:
+            if forced.get("type") == "function":
+                forced_name = forced.get("function", {}).get("name")
+        except Exception:
+            forced_name = None
+
+    # Turn chat messages into a compact transcript.
+    # We avoid relying on tokenizer chat templates so tool-role messages work everywhere.
+    lines: list[str] = []
+    for m in messages:
+        role = (m.role or "").strip().lower()
+
+        if role == "tool":
+            tool_name = m.name or "tool"
+            tcid = m.tool_call_id or "-"
+            lines.append(f"TOOL[{tool_name} id={tcid}]: {m.content or ''}".strip())
+            continue
+
+        if role == "assistant" and m.tool_calls:
+            # Previous tool call(s) issued by the assistant
+            try:
+                for tc in m.tool_calls:
+                    args_obj = {}
+                    try:
+                        args_obj = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                    except Exception:
+                        args_obj = {"_raw": tc.function.arguments}
+                    lines.append(
+                        f"ASSISTANT_TOOL_CALL[{tc.function.name} id={tc.id}]: {json.dumps(args_obj, ensure_ascii=False)}"
+                    )
+            except Exception:
+                pass
+            # Also include any assistant content (if present)
+            if m.content:
+                lines.append(f"ASSISTANT: {m.content}")
+            continue
+
+        # default: user/system/assistant content
+        if role == "system":
+            lines.append(f"SYSTEM: {m.content or ''}")
+        elif role == "user":
+            lines.append(f"USER: {m.content or ''}")
+        elif role == "assistant":
+            lines.append(f"ASSISTANT: {m.content or ''}")
+        else:
+            lines.append(f"{role.upper()}: {m.content or ''}")
+
+    transcript = "\n".join(lines).strip()
+
+    choice_line = f"tool_choice={json.dumps(forced, ensure_ascii=False)}"
+    if forced_name:
+        choice_line += f" (forced_name={forced_name})"
+
+    prompt = (
+        _TOOL_JSON_MODE_INSTRUCTION
+        + "\n\nAvailable tools (JSON):\n"
+        + json.dumps(tools_payload, ensure_ascii=False)
+        + "\n\n"
+        + choice_line
+        + "\n\nConversation so far:\n"
+        + transcript
+        + "\n\nNow produce the JSON object: "
+    )
+    return prompt
+
+
+def _tool_choice_instruction(tool_choice: Optional[Union[str, dict]]) -> str:
+    if not tool_choice:
+        return "tool_choice=auto"
+    if isinstance(tool_choice, str):
+        return f"tool_choice={tool_choice}"
+    if isinstance(tool_choice, dict):
+        try:
+            if tool_choice.get("type") == "function":
+                name = tool_choice.get("function", {}).get("name")
+                if name:
+                    return f"tool_choice=forced({name})"
+        except Exception:
+            pass
+    return f"tool_choice={json.dumps(tool_choice, ensure_ascii=False)}"
+
+
+def _use_glm_tool_template() -> bool:
+    # Heuristic: GLM chat template contains <tool_call> markers
+    try:
+        tmpl = getattr(_tok, "chat_template", "") or ""
+        return "<tool_call>" in tmpl
+    except Exception:
+        return False
+
+
+def _build_glm_tool_prompt(
+    messages: list[ChatMessage],
+    tools: list[ToolDefinition],
+    tool_choice: Optional[Union[str, dict]],
+) -> str:
+    # Prepend a system hint about tool_choice to bias the model
+    tool_hint = _tool_choice_instruction(tool_choice)
+    sys_msg = ChatMessage(role="system", content=f"Use tools when appropriate. {tool_hint}.")
+
+    msgs = [sys_msg] + messages
+    tools_payload = [
+        {
+            "type": t.type,
+            "function": {
+                "name": t.function.name,
+                "description": t.function.description,
+                "parameters": t.function.parameters,
+            },
+        }
+        for t in tools
+    ]
+
+    if hasattr(_tok, "apply_chat_template"):
+        msg_dicts = []
+        for m in msgs:
+            md = m.model_dump()
+            # GLM template expects tool_calls[].function.arguments to be an object
+            if md.get("role") == "assistant" and md.get("tool_calls"):
+                for tc in md["tool_calls"]:
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            fn["arguments"] = json.loads(args)
+                        except Exception:
+                            fn["arguments"] = {"_raw": args}
+            msg_dicts.append(md)
+        return _tok.apply_chat_template(
+            msg_dicts,
+            tokenize=False,
+            add_generation_prompt=True,
+            tools=tools_payload,
+        )
+    # Fallback to raw JSON-mode prompt if template is unavailable
+    return _inject_tool_calling_prompt(messages, tools, tool_choice)
+
+
+def _parse_tool_response(
+    completion_text: str,
+) -> tuple[Optional[list[ToolCall]], Optional[str]]:
+    """Return (tool_calls, content). Exactly one will be non-None."""
+    try:
+        obj = _extract_json_obj(completion_text)
+    except Exception:
+        obj = None
+
+    # GLM-style <tool_call> parsing (XML-ish)
+    if obj is None and "<tool_call>" in completion_text:
+        tool_calls: list[ToolCall] = []
+        for block in re.findall(r"<tool_call>(.*?)</tool_call>", completion_text, re.DOTALL):
+            block = block.strip()
+            if not block:
+                continue
+            # First token before any <arg_key> is the function name
+            fn_name = block.split("<arg_key>", 1)[0].strip()
+            args: dict[str, str] = {}
+            for k, v in re.findall(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", block, re.DOTALL):
+                args[k.strip()] = v.strip().strip('"')
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=ToolCallFunction(
+                        name=fn_name,
+                        arguments=json.dumps(args, ensure_ascii=False),
+                    ),
+                )
+            )
+        if tool_calls:
+            return tool_calls, None
+        return None, completion_text.strip()
+
+    # Heuristic fallback: "Tool: <name>" + "Parameters: {..}"
+    if obj is None and "Tool:" in completion_text and "Parameters:" in completion_text:
+        m = re.search(r"Tool:\s*([\w\-]+)\s*\nParameters:\s*(\{.*?\})", completion_text, re.DOTALL)
+        if m:
+            name = m.group(1).strip()
+            args_raw = m.group(2).strip()
+            try:
+                args_obj = json.loads(args_raw)
+            except Exception:
+                args_obj = {"_raw": args_raw}
+            return [
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=ToolCallFunction(
+                        name=name,
+                        arguments=json.dumps(args_obj, ensure_ascii=False),
+                    ),
+                )
+            ], None
+
+    if isinstance(obj, dict) and "tool_calls" in obj and obj["tool_calls"] is not None:
+        calls_in = obj["tool_calls"]
+        if not isinstance(calls_in, list):
+            raise ValueError("tool_calls must be a list")
+
+        tool_calls: list[ToolCall] = []
+        for c in calls_in:
+            if not isinstance(c, dict):
+                continue
+            fn = c.get("function") or {}
+            args = fn.get("arguments", {})
+            # OpenAI requires arguments to be a JSON string; we accept object and stringify it.
+            if isinstance(args, (dict, list)):
+                args_str = json.dumps(args, ensure_ascii=False)
+            else:
+                args_str = str(args)
+
+            tool_calls.append(
+                ToolCall(
+                    id=str(c.get("id") or f"call_{uuid.uuid4().hex[:8]}"),
+                    type=str(c.get("type") or "function"),
+                    function=ToolCallFunction(
+                        name=str(fn.get("name") or ""),
+                        arguments=args_str,
+                    ),
+                )
+            )
+
+        return tool_calls, None
+
+    # Normal answer
+    if isinstance(obj, dict) and "content" in obj:
+        return None, str(obj.get("content") or "")
+
+    # Fallback: treat as content if JSON shape is unknown
+    return None, completion_text.strip()
+
+
+def _build_tool_calls_response(
+    *,
+    model_id: str,
+    tool_calls: list[ToolCall],
+    prompt_tokens: int,
+    completion_tokens: int,
+    timing: dict,
+) -> dict:
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [tc.model_dump() for tc in tool_calls],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        "timing": timing,
+    }
+def _build_chat_prompt(messages: list[ChatMessage], tool_ctx: Optional[dict] = None) -> str:
+    # Tool calling MVP: build a raw-text prompt that requests a single JSON object.
+    if tool_ctx and tool_ctx.get("tools"):
+        if _use_glm_tool_template():
+            return _build_glm_tool_prompt(
+                messages,
+                tools=tool_ctx["tools"],
+                tool_choice=tool_ctx.get("tool_choice"),
+            )
+        return _inject_tool_calling_prompt(
+            messages,
+            tools=tool_ctx["tools"],
+            tool_choice=tool_ctx.get("tool_choice"),
+        )
+
     # Use memory manager's safe prompt builder (disables Qwen3 thinking)
     if _mm is not None:
         msgs = [{"role": m.role, "content": m.content} for m in messages]
@@ -392,6 +932,299 @@ def _build_chat_prompt(messages: list[ChatMessage]) -> str:
     parts = [f"{m.role.upper()}: {m.content}" for m in messages]
     parts.append("ASSISTANT:")
     return "\n".join(parts)
+
+
+def _infer_tool_call_from_user(
+    messages: list[ChatMessage],
+    tools: list[ToolDefinition],
+    tool_choice: Optional[Union[str, dict]],
+) -> Optional[list[ToolCall]]:
+    # Honor explicit "none"
+    if tool_choice == "none":
+        return None
+
+    # Find last user message
+    last_user = None
+    for m in reversed(messages):
+        if (m.role or "").lower() == "user":
+            last_user = m.content or ""
+            break
+    if not last_user:
+        return None
+    # Normalize escaped quotes if present
+    last_user_norm = last_user.replace('\\"', '"')
+
+    forced_name = None
+    if isinstance(tool_choice, dict):
+        try:
+            if tool_choice.get("type") == "function":
+                forced_name = tool_choice.get("function", {}).get("name")
+        except Exception:
+            forced_name = None
+
+    tool_names = [t.function.name for t in tools if t and t.function and t.function.name]
+    name = forced_name
+    if not name and len(tool_names) == 1:
+        name = tool_names[0]
+    if not name:
+        # Heuristic tool routing by keyword score (name + description + schema hints).
+        text = last_user_norm.lower()
+        best_name = None
+        best_score = 0.0
+        for t in tools:
+            if not (t and t.function and t.function.name):
+                continue
+            tn = t.function.name
+            score = 0.0
+            tn_low = tn.lower()
+            desc = (t.function.description or "").lower()
+
+            # Direct name hit
+            if tn_low in text:
+                score += 10.0
+
+            # Generic intent keywords
+            if any(k in text for k in ("search", "搜索", "查一下", "查询", "新闻", "news")):
+                if any(k in tn_low for k in ("search", "find", "query")) or any(
+                    k in desc for k in ("search", "query", "新闻", "news")
+                ):
+                    score += 4.0
+            if any(k in text for k in ("weather", "天气", "温度", "下雨")):
+                if any(k in tn_low for k in ("weather", "forecast")) or any(
+                    k in desc for k in ("weather", "forecast", "天气")
+                ):
+                    score += 4.0
+            if any(k in text for k in ("time", "几点", "时间", "时区", "timezone")):
+                if any(k in tn_low for k in ("time", "clock")) or any(
+                    k in desc for k in ("time", "timezone", "时区", "时间")
+                ):
+                    score += 4.0
+
+            # Schema hints
+            try:
+                params = t.function.parameters or {}
+                props = (params.get("properties") or {}) if isinstance(params, dict) else {}
+                prop_keys = " ".join(str(k).lower() for k in props.keys())
+                if any(k in text for k in ("city", "城市", "北京", "上海")) and any(
+                    k in prop_keys for k in ("city", "location")
+                ):
+                    score += 1.5
+                if any(k in text for k in ("timezone", "时区", "tokyo", "asia/")) and "timezone" in prop_keys:
+                    score += 1.5
+                if any(k in text for k in ("新闻", "news", "搜索", "search")) and any(
+                    k in prop_keys for k in ("query", "q", "keyword")
+                ):
+                    score += 1.5
+            except Exception:
+                pass
+
+            if score > best_score:
+                best_name = tn
+                best_score = score
+
+        # Avoid random tool calls on weak confidence.
+        if best_score >= 2.0:
+            name = best_name
+    if not name:
+        return None
+
+    def _extract_keyvals(text: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for k, v in re.findall(r"(\w+)\s*=\s*\"([^\"]+)\"", text):
+            out[k] = v
+        for k, v in re.findall(r"(\w+)\s*=\s*([^\s,;]+)", text):
+            if k not in out:
+                out[k] = v
+        # Also accept JSON-like "key":"value"
+        for k, v in re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"([^"]+)"', text):
+            if k not in out:
+                out[k] = v
+        return out
+
+    def _extract_timezone(text: str) -> Optional[str]:
+        m = re.search(r"\b([A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?)\b", text)
+        return m.group(1) if m else None
+
+    def _extract_location_like(text: str) -> Optional[str]:
+        # English: "... in Tokyo" / "for Berlin"
+        m = re.search(
+            r"\b(?:in|at|for|around)\s+([A-Za-z][A-Za-z ._-]{1,40})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            return m.group(1).strip(" .,!?")
+
+        # Chinese: "...北京天气..." / "...上海..."
+        m = re.search(r"([\u4e00-\u9fff]{2,8}(?:市|省|区|县)?)", text)
+        if m:
+            return m.group(1)
+        return None
+
+    args: dict[str, str] = _extract_keyvals(last_user_norm)
+
+    # Fill required fields heuristically when model/tool parser leaves empty args.
+    target_tool = next((t for t in tools if t and t.function and t.function.name == name), None)
+    required: list[str] = []
+    if target_tool is not None:
+        try:
+            params = target_tool.function.parameters or {}
+            if isinstance(params, dict):
+                required = [str(x) for x in (params.get("required") or [])]
+        except Exception:
+            required = []
+
+    for req_key in required:
+        if req_key in args and str(args[req_key]).strip():
+            continue
+        lk = req_key.lower()
+        # First try explicit "key=..." style with the required key name.
+        m = re.search(rf"{re.escape(req_key)}\s*=\s*\"([^\"]+)\"", last_user_norm, flags=re.IGNORECASE)
+        if not m:
+            m = re.search(rf"{re.escape(req_key)}\s*=\s*([^\s,;]+)", last_user_norm, flags=re.IGNORECASE)
+        if m:
+            args[req_key] = m.group(1).strip()
+            continue
+
+        if lk in ("timezone", "tz"):
+            tz = _extract_timezone(last_user_norm)
+            if tz:
+                args[req_key] = tz
+                continue
+
+        if lk in ("city", "location", "place", "region"):
+            loc = _extract_location_like(last_user_norm)
+            if loc:
+                args[req_key] = loc
+                continue
+        if lk in ("query", "q", "keyword", "keywords", "topic"):
+            # keep user intent as search query (strip obvious command prefixes)
+            q = last_user_norm
+            q = re.sub(r"^\s*(请|帮我|麻烦你)?\s*(搜索|查询|查一下|查|search)\s*", "", q, flags=re.IGNORECASE)
+            q = re.sub(r"^\s*(一下|一下子)\s*", "", q)
+            q = q.strip("。.!?？")
+            if q:
+                args[req_key] = q
+
+    return [
+        ToolCall(
+            id=f"call_{uuid.uuid4().hex[:8]}",
+            type="function",
+            function=ToolCallFunction(
+                name=name,
+                arguments=json.dumps(args, ensure_ascii=False),
+            ),
+        )
+    ]
+
+
+def _infer_tool_call_from_text(
+    text: str,
+    tools: list[ToolDefinition],
+    tool_choice: Optional[Union[str, dict]],
+) -> Optional[list[ToolCall]]:
+    if not text:
+        return None
+    return _infer_tool_call_from_user(
+        [ChatMessage(role="user", content=text)], tools, tool_choice
+    )
+
+
+def _is_empty_tool_args(args_str: Optional[str]) -> bool:
+    s = (args_str or "").strip().lower()
+    return s in ("", "{}", "null")
+
+
+def _last_user_text(messages: list[ChatMessage]) -> str:
+    for m in reversed(messages):
+        if (m.role or "").lower() == "user" and (m.content or "").strip():
+            return m.content or ""
+    return ""
+
+
+def _patch_empty_tool_args(
+    tool_calls: list[ToolCall],
+    messages: list[ChatMessage],
+    tools: list[ToolDefinition],
+) -> list[ToolCall]:
+    """
+    For GLM outputs where tool_calls are emitted with empty arguments ("{}"),
+    patch required fields from user text using lightweight extraction.
+    """
+    if not tool_calls or not messages:
+        return tool_calls
+
+    user_text = _last_user_text(messages)
+    if not user_text:
+        return tool_calls
+
+    schema_by_name: dict[str, dict] = {}
+    for t in tools or []:
+        try:
+            if t and t.function and t.function.name:
+                schema_by_name[t.function.name] = t.function.parameters or {}
+        except Exception:
+            pass
+
+    # Generic candidates from raw text
+    kv: dict[str, str] = {}
+    for k, v in re.findall(r"(\w+)\s*=\s*\"([^\"]+)\"", user_text):
+        kv[k] = v
+    for k, v in re.findall(r"(\w+)\s*=\s*([^\s,;]+)", user_text):
+        if k not in kv:
+            kv[k] = v
+    for k, v in re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"([^"]+)"', user_text):
+        if k not in kv:
+            kv[k] = v
+
+    m_tz = re.search(r"\b([A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?)\b", user_text)
+    tz = m_tz.group(1) if m_tz else None
+
+    m_en_loc = re.search(
+        r"\b(?:in|at|for|around)\s+([A-Za-z][A-Za-z ._-]{1,40})",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    en_loc = m_en_loc.group(1).strip(" .,!?") if m_en_loc else None
+    m_zh_loc = re.search(r"([\u4e00-\u9fff]{2,8}(?:市|省|区|县)?)", user_text)
+    zh_loc = m_zh_loc.group(1) if m_zh_loc else None
+    loc = en_loc or zh_loc
+
+    for tc in tool_calls:
+        if not _is_empty_tool_args(tc.function.arguments):
+            continue
+
+        fn_name = (tc.function.name or "").strip()
+        schema = schema_by_name.get(fn_name, {})
+        required = []
+        if isinstance(schema, dict):
+            required = [str(x) for x in (schema.get("required") or [])]
+
+        patched: dict[str, str] = {}
+        for req in required:
+            if req in kv and str(kv[req]).strip():
+                patched[req] = str(kv[req]).strip()
+                continue
+            lk = req.lower()
+            if lk in ("timezone", "tz") and tz:
+                patched[req] = tz
+                continue
+            if lk in ("city", "location", "place", "region") and loc:
+                patched[req] = loc
+                continue
+
+        # Heuristic fallback by function name when required[] is absent/empty.
+        if not patched:
+            lfn = fn_name.lower()
+            if ("weather" in lfn or "temperature" in lfn) and loc:
+                patched["city"] = loc
+            elif ("time" in lfn or "clock" in lfn) and tz:
+                patched["timezone"] = tz
+
+        if patched:
+            tc.function.arguments = json.dumps(patched, ensure_ascii=False)
+
+    return tool_calls
 
 
 def _safe_max_tokens(requested: Optional[int]) -> int:
@@ -462,12 +1295,23 @@ def rank0_broadcast_task(task: dict) -> None:
         send_msg(s, {"type": "task", **task})
 
 
-def rank0_wait_done(expected_world_size: int) -> None:
+def rank0_wait_done(expected_world_size: int, timeout_s: Optional[float] = None) -> None:
     """
     Wait for {"type":"done"} from all workers.
     """
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("CTRL_DONE_TIMEOUT", "25"))
+
     done: set[int] = set()
+    t0 = time.time()
     while len(done) < (expected_world_size - 1):
+        if time.time() - t0 > timeout_s:
+            pending = [r for r in range(1, expected_world_size) if r not in done]
+            raise TimeoutError(
+                f"Timed out waiting worker done acks after {timeout_s:.1f}s; "
+                f"pending ranks={pending}"
+            )
+
         with _worker_lock:
             items = list(_worker_socks.items())
         for r, s in items:
@@ -476,8 +1320,31 @@ def rank0_wait_done(expected_world_size: int) -> None:
             s.settimeout(0.2)
             try:
                 msg = recv_msg(s)
-            except Exception:
-                msg = None
+            except (socket.timeout, TimeoutError):
+                # No data yet: worker may still be generating.
+                continue
+            except (ConnectionResetError, BrokenPipeError):
+                raise ConnectionError(
+                    f"Worker rank {r} control socket disconnected while waiting for done"
+                )
+            except OSError as e:
+                # Distinguish transient timeout-style OSErrors from real disconnects.
+                if "timed out" in str(e).lower():
+                    continue
+                raise ConnectionError(
+                    f"Worker rank {r} control socket error while waiting for done: {e}"
+                )
+            finally:
+                try:
+                    s.settimeout(None)
+                except Exception:
+                    pass
+
+            if msg is None:
+                # EOF means peer closed the socket.
+                raise ConnectionError(
+                    f"Worker rank {r} control socket disconnected while waiting for done"
+                )
             if msg and msg.get("type") == "done":
                 done.add(r)
 
@@ -491,8 +1358,31 @@ def worker_loop(rank: int) -> None:
     For each task: call generate() (so collectives match rank0), then send done.
     Exits cleanly when the control socket closes (rank0 shutdown / Ctrl+C).
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((CTRL_HOST, CTRL_PORT))
+    timeout_s = float(os.environ.get("CTRL_CONNECT_TIMEOUT", "60"))
+    delay_s = float(os.environ.get("CTRL_CONNECT_DELAY", "0.2"))
+    deadline = time.time() + timeout_s
+
+    # Control-plane may start slightly after workers finish loading
+    # (rank0 starts listener post-load). Retry until it comes up.
+    s: Optional[socket.socket] = None
+    while True:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            s.connect((CTRL_HOST, CTRL_PORT))
+            s.settimeout(None)
+            break
+        except (ConnectionRefusedError, TimeoutError, OSError):
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            if time.time() >= deadline:
+                raise
+            time.sleep(delay_s)
+            delay_s = min(delay_s * 1.5, 2.0)
+
     send_msg(s, {"type": "hello", "rank": rank})
     print(
         f"[worker {rank}] connected to control-plane {CTRL_HOST}:{CTRL_PORT}",
@@ -575,9 +1465,16 @@ async def _queue_worker() -> None:
             _queue.task_done()
             continue
 
-        kind, prompt, max_t, result_target, is_stream = (
-            item  # kind: "chat" | "completions"
-        )
+        # kind: "chat" | "completions"
+        if isinstance(item, tuple) and len(item) == 7:
+            kind, prompt, max_t, result_target, is_stream, tool_ctx, req_messages = item
+        elif isinstance(item, tuple) and len(item) == 6:
+            kind, prompt, max_t, result_target, is_stream, tool_ctx = item
+            req_messages = None
+        else:
+            kind, prompt, max_t, result_target, is_stream = item
+            tool_ctx = None
+            req_messages = None
 
         # ── Per-request tracking ──────────────────────────────────
         req_id = (
@@ -604,6 +1501,19 @@ async def _queue_worker() -> None:
                 t0 = time.time()
                 token_count = 0
                 _aborted = False
+                tool_streaming = (
+                    kind == "chat"
+                    and tool_ctx
+                    and tool_ctx.get("tools")
+                    and tool_ctx.get("tool_choice") != "none"
+                )
+                buffer = ""
+                state = "tool" if tool_streaming else "unknown"
+                tool_calls: Optional[list[ToolCall]] = None
+                parsed_content: Optional[str] = None
+                emitted_clean = ""
+                tool_calls_emitted = False
+                suppress_text_output = False
 
                 for response in stream_generate(_model, _tok, prompt, max_tokens=max_t):
                     token_count += 1
@@ -632,9 +1542,104 @@ async def _queue_worker() -> None:
                             req_finish_reason = "memory_pressure"
                             break
 
-                    token_text = (
-                        response.text
-                    )  # GenerationResponse.text contains the decoded text
+                    token_text = response.text
+
+                    if tool_streaming:
+                        buffer += token_text
+
+                        # Try to parse tool call from buffer
+                        try:
+                            tool_calls, parsed_content = _parse_tool_response(
+                                _sanitize_assistant_output(buffer)
+                            )
+                        except Exception:
+                            tool_calls, parsed_content = None, None
+
+                        if tool_calls:
+                            # Prefer inferred args when model returns empty args
+                            inferred = None
+                            if req_messages:
+                                inferred = _infer_tool_call_from_user(
+                                    req_messages, tool_ctx["tools"], tool_ctx.get("tool_choice")
+                                )
+                            if not inferred:
+                                inferred = _infer_tool_call_from_text(
+                                    prompt, tool_ctx["tools"], tool_ctx.get("tool_choice")
+                                )
+                            if inferred:
+                                empty_args = all(
+                                    (tc.function.arguments or "").strip()
+                                    in ("", "{}", "null")
+                                    for tc in tool_calls
+                                )
+                                if empty_args:
+                                    tool_calls = inferred
+                            if req_messages:
+                                tool_calls = _patch_empty_tool_args(
+                                    tool_calls, req_messages, tool_ctx["tools"]
+                                )
+
+                            # Emit tool_calls delta once, then keep draining generation
+                            # to completion so rank0 and worker collectives stay aligned.
+                            if not tool_calls_emitted:
+                                delta_calls = []
+                                for i, tc in enumerate(tool_calls):
+                                    delta_calls.append(
+                                        {
+                                            "index": i,
+                                            "id": tc.id,
+                                            "type": tc.type,
+                                            "function": {
+                                                "name": tc.function.name,
+                                                "arguments": tc.function.arguments,
+                                            },
+                                        }
+                                    )
+                                chunk = {
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": MODEL_ID,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"tool_calls": delta_calls},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                                await chunk_queue.put(f"data: {json.dumps(chunk)}\n\n")
+                                tool_calls_emitted = True
+                            continue
+
+                        # If model produced content JSON, keep it as fallback
+                        if parsed_content is not None:
+                            state = "content"
+                        continue
+
+                    # Default streaming (no tools or tool_choice=none)
+                    buffer += token_text
+                    clean_text = _sanitize_assistant_output(buffer)
+                    delta_text = ""
+                    if clean_text.startswith(emitted_clean):
+                        delta_text = clean_text[len(emitted_clean) :]
+                    else:
+                        # Sanitization removed/rewrote earlier text; emit the new tail only.
+                        i = 0
+                        max_i = min(len(clean_text), len(emitted_clean))
+                        while i < max_i and clean_text[i] == emitted_clean[i]:
+                            i += 1
+                        delta_text = clean_text[i:]
+                    emitted_clean = clean_text
+
+                    if delta_text == "":
+                        if _contains_model_stop_marker(buffer):
+                            suppress_text_output = True
+                        continue
+
+                    if suppress_text_output:
+                        continue
+
                     if kind == "chat":
                         chunk = {
                             "id": req_id,
@@ -644,7 +1649,7 @@ async def _queue_worker() -> None:
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": token_text},
+                                    "delta": {"content": delta_text},
                                     "finish_reason": None,
                                 }
                             ],
@@ -658,13 +1663,15 @@ async def _queue_worker() -> None:
                             "choices": [
                                 {
                                     "index": 0,
-                                    "text": token_text,
+                                    "text": delta_text,
                                     "finish_reason": None,
                                     "logprobs": None,
                                 }
                             ],
                         }
                     await chunk_queue.put(f"data: {json.dumps(chunk)}\n\n")
+                    if _contains_model_stop_marker(buffer):
+                        suppress_text_output = True
 
                 mx.eval()
                 t1 = time.time()
@@ -691,6 +1698,69 @@ async def _queue_worker() -> None:
 
                 # Send final chunk with finish_reason
                 _finish = "stop" if not _aborted else "memory_pressure"
+                if tool_streaming and not _aborted:
+                    if not tool_calls:
+                        # Final fallback: infer tool call from prompt
+                        inferred = None
+                        if req_messages:
+                            inferred = _infer_tool_call_from_user(
+                                req_messages, tool_ctx["tools"], tool_ctx.get("tool_choice")
+                            )
+                        if not inferred:
+                            inferred = _infer_tool_call_from_text(
+                                prompt, tool_ctx["tools"], tool_ctx.get("tool_choice")
+                            )
+                        if inferred:
+                            tool_calls = inferred
+                            delta_calls = []
+                            for i, tc in enumerate(tool_calls):
+                                delta_calls.append(
+                                    {
+                                        "index": i,
+                                        "id": tc.id,
+                                        "type": tc.type,
+                                        "function": {
+                                            "name": tc.function.name,
+                                            "arguments": tc.function.arguments,
+                                        },
+                                    }
+                                )
+                            chunk = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": MODEL_ID,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"tool_calls": delta_calls},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            await chunk_queue.put(f"data: {json.dumps(chunk)}\n\n")
+                        elif parsed_content:
+                            # Fallback to content if no tool call could be inferred
+                            chunk = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": MODEL_ID,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": parsed_content},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            await chunk_queue.put(f"data: {json.dumps(chunk)}\n\n")
+                    if tool_calls:
+                        if req_messages:
+                            tool_calls = _patch_empty_tool_args(
+                                tool_calls, req_messages, tool_ctx["tools"]
+                            )
+                        _finish = "tool_calls"
                 req_finish_reason = _finish
                 if kind == "chat":
                     final_chunk = {
@@ -740,6 +1810,71 @@ async def _queue_worker() -> None:
                 completion = (
                     out_text[len(prompt) :] if out_text.startswith(prompt) else out_text
                 )
+                completion = _sanitize_assistant_output(completion)
+
+                # Tool calling MVP: parse a single JSON object from the model output when tools are enabled
+                parsed_tool_calls: Optional[list[ToolCall]] = None
+                parsed_content: Optional[str] = None
+                if kind == "chat" and tool_ctx and tool_ctx.get("tools"):
+                    try:
+                        parsed_tool_calls, parsed_content = _parse_tool_response(completion)
+                    except Exception as e:
+                        # If parsing fails, fall back to plain text completion
+                        log.warning(f"tool parse failed; falling back to text: {e}")
+                        parsed_tool_calls, parsed_content = None, completion
+
+                    if parsed_content is not None:
+                        parsed_content = _sanitize_assistant_output(parsed_content)
+
+                    # Enforce tool_choice="none"
+                    if tool_ctx.get("tool_choice") == "none":
+                        parsed_tool_calls = None
+
+                    # Heuristic fallback: infer tool call from user message if model didn't emit one
+                    inferred = None
+                    msg_list = req_messages or (tool_ctx.get("messages") if tool_ctx else []) or []
+                    if parsed_tool_calls is None:
+                        inferred = _infer_tool_call_from_user(
+                            msg_list, tool_ctx["tools"], tool_ctx.get("tool_choice")
+                        )
+                        if inferred:
+                            parsed_tool_calls = inferred
+                            parsed_content = None
+                    else:
+                        inferred = _infer_tool_call_from_user(
+                            msg_list, tool_ctx["tools"], tool_ctx.get("tool_choice")
+                        )
+                        if inferred:
+                            # If model returned empty args, prefer inferred args
+                            empty_args = all(
+                                (tc.function.arguments or "").strip() in ("", "{}", "null")
+                                for tc in parsed_tool_calls
+                            )
+                            if empty_args:
+                                parsed_tool_calls = inferred
+                                parsed_content = None
+                        elif parsed_tool_calls:
+                            # Fallback: try parsing from prompt text
+                            empty_args = all(
+                                (tc.function.arguments or "").strip() in ("", "{}", "null")
+                                for tc in parsed_tool_calls
+                            )
+                            if empty_args:
+                                inferred_from_prompt = _infer_tool_call_from_text(
+                                    prompt, tool_ctx["tools"], tool_ctx.get("tool_choice")
+                                )
+                                if inferred_from_prompt:
+                                    parsed_tool_calls = inferred_from_prompt
+                                    parsed_content = None
+
+                    if parsed_tool_calls is not None and req_messages:
+                        parsed_tool_calls = _patch_empty_tool_args(
+                            parsed_tool_calls, msg_list, tool_ctx["tools"]
+                        )
+
+                    # If we got a normal content answer, replace completion with it.
+                    if parsed_content is not None:
+                        completion = parsed_content
                 pt = _tok_len(prompt)
                 ct = _tok_len(completion)
                 elapsed = t1 - t0
@@ -768,25 +1903,35 @@ async def _queue_worker() -> None:
                     )
 
                 if kind == "chat":
-                    resp = {
-                        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": MODEL_ID,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {"role": "assistant", "content": completion},
-                                "finish_reason": "stop",
-                            }
-                        ],
-                        "usage": {
-                            "prompt_tokens": pt,
-                            "completion_tokens": ct,
-                            "total_tokens": pt + ct,
-                        },
-                        "timing": timing,
-                    }
+                    # If tools were enabled and the model requested tool calls, emit finish_reason="tool_calls"
+                    if parsed_tool_calls:
+                        resp = _build_tool_calls_response(
+                            model_id=MODEL_ID,
+                            tool_calls=parsed_tool_calls,
+                            prompt_tokens=pt,
+                            completion_tokens=ct,
+                            timing=timing,
+                        )
+                    else:
+                        resp = {
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": MODEL_ID,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": completion},
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": pt,
+                                "completion_tokens": ct,
+                                "total_tokens": pt + ct,
+                            },
+                            "timing": timing,
+                        }
                 elif kind == "completions":
                     resp = {
                         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
@@ -836,6 +1981,12 @@ async def _queue_worker() -> None:
             req_status = STATUS_ERROR if _REQUEST_LOG_AVAILABLE else "error"
             req_error_msg = str(e)
             req_finish_reason = "error"
+            log.exception(
+                "Queue worker request failed: kind=%s stream=%s req_id=%s",
+                kind,
+                is_stream,
+                req_id,
+            )
             if _DASHBOARD_AVAILABLE and metrics_store is not None:
                 asyncio.create_task(metrics_store.record_error())
             if is_stream:
@@ -1485,14 +2636,85 @@ async def chat_completions(req: ChatCompletionsReq):
                 detail=f"Memory pressure too high to accept request: {e}",
             )
 
-    prompt = _build_chat_prompt(req.messages)
+    tool_ctx = None
+    if req.tools:
+        # If tool results are already present, discourage additional tool calls
+        has_tool_msg = any((m.role or "") == "tool" for m in req.messages)
+        tool_choice = req.tool_choice
+        if has_tool_msg and (tool_choice is None or tool_choice == "auto"):
+            tool_choice = "none"
+
+        tool_ctx = {
+            "tools": req.tools,
+            "tool_choice": tool_choice,
+            "messages": req.messages,
+        }
+
+    prompt = _build_chat_prompt(req.messages, tool_ctx=tool_ctx)
     max_t = _safe_max_tokens(req.max_tokens or DEFAULT_MAX_TOKENS)
 
     if req.stream:
         # Streaming mode: return SSE response
         chunk_queue: asyncio.Queue = asyncio.Queue()
+        # Fast-path: streaming tool_calls without model execution
+        if tool_ctx and tool_ctx.get("tools") and tool_ctx.get("tool_choice") != "none":
+            inferred = _infer_tool_call_from_user(
+                req.messages, tool_ctx["tools"], tool_ctx.get("tool_choice")
+            )
+            if inferred:
+                created = int(time.time())
+                delta_calls = []
+                for i, tc in enumerate(inferred):
+                    delta_calls.append(
+                        {
+                            "index": i,
+                            "id": tc.id,
+                            "type": tc.type,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                    )
+
+                async def _tool_stream():
+                    chunk = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_ID,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"tool_calls": delta_calls},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    final_chunk = {
+                        "id": chunk["id"],
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_ID,
+                        "choices": [
+                            {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+                        ],
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    _tool_stream(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
         try:
-            _queue.put_nowait(("chat", prompt, max_t, chunk_queue, True))
+            _queue.put_nowait(("chat", prompt, max_t, chunk_queue, True, tool_ctx, req.messages))
         except asyncio.QueueFull:
             raise HTTPException(
                 status_code=429, detail="Server busy (queue full). Try again later."
@@ -1513,7 +2735,7 @@ async def chat_completions(req: ChatCompletionsReq):
         fut: asyncio.Future = loop.create_future()
 
         try:
-            _queue.put_nowait(("chat", prompt, max_t, fut, False))
+            _queue.put_nowait(("chat", prompt, max_t, fut, False, tool_ctx, req.messages))
         except asyncio.QueueFull:
             raise HTTPException(
                 status_code=429, detail="Server busy (queue full). Try again later."
@@ -1567,7 +2789,7 @@ async def completions(req: CompletionsReq):
         # Streaming mode: return SSE response
         chunk_queue: asyncio.Queue = asyncio.Queue()
         try:
-            _queue.put_nowait(("completions", prompt, max_t, chunk_queue, True))
+            _queue.put_nowait(("completions", prompt, max_t, chunk_queue, True, None))
         except asyncio.QueueFull:
             raise HTTPException(
                 status_code=429, detail="Server busy (queue full). Try again later."
@@ -1588,7 +2810,7 @@ async def completions(req: CompletionsReq):
         fut: asyncio.Future = loop.create_future()
 
         try:
-            _queue.put_nowait(("completions", prompt, max_t, fut, False))
+            _queue.put_nowait(("completions", prompt, max_t, fut, False, None))
         except asyncio.QueueFull:
             raise HTTPException(
                 status_code=429, detail="Server busy (queue full). Try again later."
